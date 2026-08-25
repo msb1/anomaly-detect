@@ -1,0 +1,188 @@
+# Kafka transport values mirror ../iot-sim/config/simulation.yaml.
+kafka:
+  brokers: "192.168.1.50:9092,192.168.1.50:9094,192.168.1.50:9096"
+  topic: "iot.telemetry.v1"
+  output_topic: "iot.anomaly.v1"
+  group_id: "anomaly-detect-v1"
+  client_id: "anomaly-detect-local"
+  auto_offset_reset: "latest"
+  # skip commits poison messages after logging; fail stops without committing them.
+  invalid_message_policy: "skip"
+  security:
+    security_protocol: null
+    sasl_mechanism: null
+    username: null
+    password: null
+
+# One event-time window policy is shared by every model. A stream is not
+# primed until it has covered duration_ms and contains minimum_samples.
+window:
+  duration_ms: 60000
+  minimum_samples: 10
+  max_lateness_ms: 5000
+
+# One preprocessing policy applies independently to every configured metric.
+# Processing order is always interpolation -> scaling -> decomposition -> smoothing.
+preprocessing:
+  interpolation:
+    enabled: true
+    # Strict upper bound: values above 0.20 are rejected at startup.
+    max_gap_fraction: 0.20
+  scaling:
+    enabled: true
+    # min_max or standard
+    method: "standard"
+    output_min: 0.0
+    output_max: 1.0
+    epsilon: 0.000000000001
+  decomposition:
+    # Enable only when window.duration_ms covers at least two periods.
+    enabled: false
+    # stl or twitter; period_ms examples: day=86400000, week=604800000
+    method: "stl"
+    period_ms: 86400000
+    stl:
+      loess_span: 7
+      robust_iterations: 2
+  smoothing:
+    enabled: true
+    # moving_average or exponential_moving_average
+    method: "moving_average"
+    window_size: 5
+
+# These exact Kafka-header matches are the ingestion allow-list. Messages that
+# match no stream are committed without decoding their JSON values. Keep the
+# entity_id, sensor_id, sensor_type and metric values aligned with iot-sim.
+streams:
+  outdoor_temperature:
+    interval_ms: 5000
+    headers:
+      entity_id: "facility_weather_station_01"
+      sensor_id: "weather-01"
+      sensor_type: "weather"
+      metric: "temperature_c"
+  outdoor_humidity:
+    interval_ms: 5000
+    headers:
+      entity_id: "facility_weather_station_01"
+      sensor_id: "weather-01"
+      sensor_type: "weather"
+      metric: "humidity_pct"
+  tank_level:
+    interval_ms: 2000
+    headers:
+      entity_id: "mixing_tank_01"
+      sensor_id: "level-01"
+      sensor_type: "level"
+      metric: "tank_level_pct"
+  tank_weight:
+    interval_ms: 2500
+    headers:
+      entity_id: "mixing_tank_01"
+      sensor_id: "load-01"
+      sensor_type: "load_cell"
+      metric: "load_cell_weight_kg"
+
+# Each univariate model names exactly one input stream. Any number of models can
+# share a stream, and other models can independently target other streams.
+# score is an absolute number of standard deviations for z_score and an
+# absolute number of median absolute deviations for mad.
+models:
+  - id: "temperature-z-score"
+    enabled: true
+    kind: "univariate"
+    algorithm: "z_score"
+    inputs: ["outdoor_temperature"]
+    parameters:
+      ddof: 1
+    thresholds:
+      score: 3.0
+
+  - id: "temperature-mad"
+    enabled: true
+    kind: "univariate"
+    algorithm: "mad"
+    inputs: ["outdoor_temperature"]
+    thresholds:
+      score: 3.5
+
+  - id: "tank-level-mad"
+    enabled: true
+    kind: "univariate"
+    algorithm: "mad"
+    inputs: ["tank_level"]
+    thresholds:
+      score: 4.0
+
+  # Multivariate engines first produce a scalar distance/reconstruction error.
+  # score_detector then applies one of the same univariate detectors above to
+  # a dedicated rolling window of those scalar scores.
+  - id: "weather-mahalanobis"
+    enabled: true
+    kind: "multivariate"
+    algorithm: "mahalanobis"
+    inputs: ["outdoor_temperature", "outdoor_humidity"]
+    parameters:
+      window_size: 16
+      max_time_skew_ms: 5000
+      regularization: 0.000001
+      shrinkage: 0.10
+      score_detector: "mad"
+      score_window_size: 12
+    thresholds:
+      score: 4.0
+
+  - id: "tank-linear-pca"
+    enabled: true
+    kind: "multivariate"
+    algorithm: "pca"
+    inputs: ["tank_level", "tank_weight"]
+    parameters:
+      window_size: 16
+      max_time_skew_ms: 2500
+      retained_components: 1
+      score_detector: "z_score"
+      score_window_size: 12
+      score_ddof: 1
+    thresholds:
+      score: 3.0
+
+  - id: "weather-kernel-pca"
+    enabled: true
+    kind: "multivariate"
+    algorithm: "kernel_pca"
+    inputs: ["outdoor_temperature", "outdoor_humidity"]
+    parameters:
+      window_size: 16
+      max_time_skew_ms: 5000
+      retained_components: 4
+      rff_dimension: 32
+      gamma: "auto"
+      seed: 20260824
+      score_detector: "mad"
+      score_window_size: 12
+    thresholds:
+      score: 4.0
+
+  # GSTA consumes complete aligned channel windows on WGPU. Its first 128
+  # windows train unconditionally; afterward only reconstruction errors at or
+  # below gate_threshold are allowed to update the model weights.
+  - id: "weather-gsta"
+    enabled: true
+    kind: "multivariate"
+    algorithm: "gsta"
+    inputs: ["outdoor_temperature", "outdoor_humidity"]
+    parameters:
+      # Twelve 5-second samples fit inside the shared 60-second event window.
+      window_size: 12
+      max_time_skew_ms: 5000
+      latent_channels: 8
+      attention_heads: 2
+      gate_threshold: 0.05
+      learning_rate: 0.001
+      warmup_steps: 128
+      seed: 20260824
+      score_detector: "mad"
+      score_window_size: 12
+    thresholds:
+      score: 4.0

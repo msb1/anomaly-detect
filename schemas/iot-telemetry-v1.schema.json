@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://iot-sim.local/schemas/entity-telemetry.schema.json",
+  "title": "IoT simulator Kafka metric message",
+  "type": "object",
+  "required": [
+    "entity_type",
+    "entity_id",
+    "sensor_id",
+    "sensor_type",
+    "timestamp_ms",
+    "metric",
+    "value"
+  ],
+  "properties": {
+    "entity_type": { "type": "string" },
+    "entity_id": { "type": "string" },
+    "sensor_id": { "type": "string" },
+    "sensor_type": { "type": "string" },
+    "timestamp_ms": { "type": "integer" },
+    "metric": { "type": "string" },
+    "value": { "type": "number" }
+  },
+  "additionalProperties": false
+}
+
