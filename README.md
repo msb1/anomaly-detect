@@ -1,8 +1,10 @@
 # anomaly-detect
 
-Rust service for streaming univariate and multivariate anomaly detection.
-The service consumes `iot-sim` telemetry from Kafka, filters records by Kafka
-headers, preprocesses selected metric windows, and evaluates Z-score and MAD
+Rust service for streaming and dataset univariate and multivariate anomaly
+detection. Streaming mode consumes `iot-sim` telemetry from Kafka; dataset mode
+downloads a Parquet dataset from RustFS/S3 and replays it through the same
+sliding windows. Both modes filter selected metric streams, preprocess their
+windows, and evaluate Z-score and MAD
 detectors directly or as the final stage after rolling Mahalanobis distance,
 linear PCA, Random-Fourier-Feature (RFF) kernel PCA, and a gated self-training
 graph-attention autoencoder (GSTA).
@@ -18,7 +20,7 @@ cargo test
 cargo run -- --config config/anomaly-detect.yaml
 ```
 
-GSTA uses Burn 0.16's WGPU backend and therefore requires a working Metal,
+GSTA uses Burn 0.21's WGPU backend and therefore requires a working Metal,
 Vulkan, DirectX 12, OpenGL, or WebGPU adapter. A configured GSTA model fails
 startup with a model error when no WGPU adapter is available; it does not
 silently change numerical backends.
@@ -55,27 +57,29 @@ with `__` between nested keys override YAML values.
 ## Ingestion and preprocessing
 
 [config/anomaly-detect.yaml](config/anomaly-detect.yaml) defines named streams.
-Each stream has exact Kafka header filters and an `interval_ms` matching its
-source cadence. Records that match no configured stream are committed without
+Each stream has exact Kafka header filters. Source cadence is carried as
+`interval_ms` in each Kafka payload. Records that match no configured stream are committed without
 parsing their JSON payload. Selected values are validated against the headers,
-then processed in this fixed order:
+then processed. Univariate metric windows use this fixed order:
 
 1. bounded linear interpolation;
 2. scaling;
-3. decomposition;
+3. Holt detrending followed by sliding-DFT deseasonality;
 4. smoothing.
 
-Each stage has a global `enabled` flag. The selected methods and their settings
-apply to every metric, but fitting is performed independently per metric
-window. This avoids mixing incomparable units such as degrees, percentages,
-and kilograms into one set of statistics.
+Multivariate metric inputs deliberately skip step 3: they receive only scaling
+and smoothing. After a multivariate engine emits its scalar distance or
+reconstruction error, that score is detrended, deseasonalized, and smoothed
+before its configured final Z-score or MAD detector. Decomposition settings apply to both
+of those univariate scoring paths, with independent state per stream/model.
 
 ### Interpolation
 
 For a stream with expected cadence `interval_ms`, missing event time is
 `new_timestamp - previous_timestamp - interval_ms`. Interpolation is allowed
-only when that missing duration is at most
-`window.duration_ms * max_gap_fraction`. Configuration validation prevents
+only when the number of missing points is at most
+`round(window.sample_count * max_gap_fraction)`. For example, a 128-point
+window and `0.20` limit allow up to 26 missing points. Configuration validation prevents
 `max_gap_fraction` from exceeding `0.20`.
 
 An allowed gap is filled at exact cadence timestamps by linear interpolation
@@ -96,19 +100,62 @@ from evicted values therefore cannot leak into the current window.
 
 ### Decomposition
 
-Seasonality is configured as event time with `period_ms`, such as `86400000`
-for a day or `604800000` for a week. Each stream converts this to a sample count
-using its own `interval_ms`. The sliding window must cover at least two periods.
+Trend removal uses causal Holt linear double exponential smoothing. `alpha`
+updates the level and `beta` updates its slope, avoiding the fixed phase lag of
+a trailing average. Deseasonality keeps a fixed detrended sample window. The
+first spectrum is initialized with an FFT; after that, the sliding DFT updates
+all frequency bins from the incoming and outgoing points in O(N) per sample.
+The dominant period is searched between `min_period_samples` and
+`max_period_samples` at `detection_interval_samples`, and its phase-aligned
+lagged value is removed. During spectral warm-up, the detrended value is the
+remainder.
 
-- `stl` performs additive seasonal-trend decomposition with local-linear,
-  tricube-weighted LOESS for the trend and seasonal subseries. Tukey bisquare
-  robustness weights are updated for `robust_iterations` passes.
-- `twitter` performs a robust Twitter-style decomposition using a global median
-  trend and median values for each seasonal phase.
+### Configure detrending and deseasonality
 
-The remainder (`observed - trend - seasonal`) becomes the downstream series.
-Until two periods are present, no processed view is published and models remain
-unready.
+The stages are independent. Enable only Holt when a metric drifts without a
+reliable cycle; enable only deseasonality for an already stationary periodic
+signal; normally enable both for a drifting seasonal signal. The checked-in
+configuration uses a 240-sample spectral window and searches on every sample:
+
+```yaml
+preprocessing:
+  decomposition:
+    trend:
+      enabled: true
+      alpha: 0.2
+      beta: 0.1
+    seasonal:
+      enabled: true
+      window_size_samples: 240
+      detection_interval_samples: 1
+      min_period_samples: 2
+      max_period_samples: 120
+```
+
+`alpha` and `beta` must be in `(0, 1]`. Higher values adapt more rapidly but
+let transient changes influence the trend estimate more strongly. Set
+`window_size_samples` to several cycles of the shortest seasonal behavior that
+matters; it is the state retained by the spectral estimator, independent of
+the direct detector's `window.sample_count`. Restrict the period range to
+plausible sample counts. For example, a 5-second signal with an expected
+10-minute cycle uses a 120-sample period; set bounds around that value rather
+than allowing every frequency bin to compete. `detection_interval_samples: 1`
+re-evaluates the dominant frequency on every arrival; a larger value reduces
+period-search work while holding the last detected period between searches.
+
+This configuration is global. It has exactly two effects:
+
+- A direct `univariate` model consumes the metric residual.
+- A `multivariate` model consumes scaled/smoothed metric coordinates, then
+  applies the same decomposition to its scalar raw score immediately before
+  final Z-score/MAD scoring.
+
+It never detrends or deseasonalizes the metric coordinates given to
+Mahalanobis, PCA, kernel PCA, or GSTA. Removed `stl`, `twitter`, `method`, and
+`period_samples` settings are invalid configuration fields.
+
+For a detailed derivation and tuning guidance, see [preprocess.md](preprocess.md);
+[architecture.md](architecture.md) shows state ownership and routing.
 
 ### Smoothing
 
@@ -123,19 +170,17 @@ decomposition is disabled.
 configured metric. Each entry contains:
 
 - a timestamp-ordered `VecDeque<Sample>` containing raw and interpolated data;
-- a derived `VecDeque<Sample>` containing the fully preprocessed values;
-- the expected interval and the raw window's first-observed timestamp and
-  event-time watermark.
+- separate derived `VecDeque<Sample>` values for univariate and multivariate
+  metric inputs;
+- state for Holt detrending and the sliding DFT.
 
 On each accepted Kafka point, the service checks lateness and interpolation,
-inserts the point(s) in timestamp order, advances the watermark, and removes raw
-points older than `watermark - duration_ms`. It then rebuilds the processed
-deque from the retained raw deque in the four-stage order above. This full
-recalculation is important: window-local scaling, seasonal estimates, and
-smoothing change when either a new point arrives or an old point expires.
+inserts the point(s) in timestamp order, advances the watermark, and removes the
+oldest raw points beyond `window.sample_count`. Scaling and smoothing remain
+window-local; decomposition state advances causally for each arriving point.
 
-A stream is primed only when it has observed at least `duration_ms`, retains at
-least `minimum_samples`, and has a valid processed view. Every enabled
+A stream is primed when it retains `window.sample_count` points and has a valid
+processed view. Every enabled
 univariate model for a changed stream becomes ready with that stream. A
 multivariate model waits for every input stream to be primed and only creates a
 new vector when every input has advanced since its previous vector.
@@ -152,13 +197,29 @@ streams. The implemented univariate algorithms are:
 
 - `z_score`: `abs(Xi - mean) / standard_deviation`; optional integer
   `parameters.ddof` defaults to `0` and must be less than
-  `window.minimum_samples`.
-- `mad`: `abs(Xi - median(X)) / median(abs(X - median(X)))`.
+  `window.sample_count`.
+- `mad`: `0.6745 * abs(Xi - median(X)) / (EMA(MAD) + epsilon)`;
+  `parameters.mad_ema_alpha` defaults to `0.05` and positive
+  `parameters.epsilon` defaults to `1e-6`.
 
 Both require a finite positive `thresholds.score`. A sample is anomalous when
 its score is strictly greater than the threshold. A constant window scores
-zero. For MAD, a non-median value in a zero-MAD window scores positive infinity
-and is anomalous.
+zero. MAD's configured epsilon keeps a non-median value in a zero-MAD window
+finite while preserving sensitivity to deviations from the flat baseline.
+
+### MAD stability controls
+
+For a direct MAD model, `parameters.mad_ema_alpha` is the raw-MAD weight in
+the model-local EMA. The first fully primed evaluation initializes that EMA to
+the raw MAD; later evaluations use `alpha * raw_mad + (1 - alpha) * prior`.
+The default `0.05` has an approximately 20-sample adaptation time, limiting
+threshold steps as the rolling median changes. `parameters.epsilon` is added
+only to the denominator and must use the units of the fully preprocessed
+stream; start at roughly 5% to 10% of normal background noise. Both values are
+validated at startup (`0 < mad_ema_alpha <= 1`, `epsilon > 0`). A stream reset
+also resets its MAD EMA, preventing an old operating regime from affecting the
+newly primed window. Detection details expose `median_absolute_deviation`,
+`smoothed_mad`, `stabilized_mad`, `mad_ema_alpha`, and `epsilon` for tuning.
 
 Each `multivariate` model has at least two inputs and uses one of:
 
@@ -173,10 +234,18 @@ Each `multivariate` model has at least two inputs and uses one of:
   dependencies among latent channels, and transposed convolutions reconstruct
   the complete channel window. Its raw score is reconstruction MSE.
 
+By default, each raw multivariate score is normalized by its configured
+`score_detector` (`z_score` or `mad`). Set
+`parameters.score_detector_enabled: false` to publish and threshold the raw
+Mahalanobis distance or reconstruction error directly; the output then uses
+`score_algorithm: raw`.
+
 The candidate is scored against the preceding multivariate baseline and is
 rolled into it afterward. The resulting Mahalanobis distance or reconstruction
-error enters its own configured `z_score` or `mad` score window. Only that
-second-stage result is a final detection. Key parameters are `window_size`,
+error is detrended and deseasonalized when those stages are enabled, then
+smoothed with the configured causal smoother before it enters its configured
+`z_score` or `mad` score window. Only that second-stage result
+is a final detection. Key parameters are `window_size`,
 `max_time_skew_ms`, `score_detector`, `score_window_size`, and the
 algorithm-specific values shown in
 [config/anomaly-detect.yaml](config/anomaly-detect.yaml). RFF `seed` makes the
@@ -213,7 +282,40 @@ under [src/univariate.rs](src/univariate.rs) and
 [src/multivariate.rs](src/multivariate.rs). See [models.md](models.md) for the
 equations, warm-up stages, configuration reference, and operational caveats.
 
-Use `RUST_LOG=anomaly_detect=debug` to see interpolation and model-readiness
-events and normal scores; anomalies are logged at warning level. With
-`invalid_message_policy: skip`, malformed selected messages are logged and
-committed; `fail` stops before committing the offending record.
+The `kafka.logging` options in the YAML control full structured record logs:
+`log_consumed_messages` logs telemetry after it passes the configured header
+allow-list, and `log_produced_results` logs each successfully published anomaly
+message, including `anomaly_score`. Both are enabled in the sample config and
+can be disabled for lower log volume or to avoid recording telemetry values.
+Use `RUST_LOG=anomaly_detect=debug` to also see interpolation and
+model-readiness events and normal-score summaries; anomalies are logged at
+warning level. With `invalid_message_policy: skip`, malformed selected messages
+are logged and committed; `fail` stops before committing the offending record.
+## Dataset mode
+
+`anomaly-detect` has two exclusive input modes: `streaming` (the default) and
+`dataset`. Streaming mode consumes `iot-sim` telemetry from Kafka and publishes
+anomaly results to Kafka as before. Dataset mode downloads a single Parquet
+object generated by `iot-sim` from RustFS/S3, reads the complete file into the
+application, orders its metric rows by source timestamp, then feeds every
+matching row through the same `Pipeline`, window store, preprocessing, and
+models used by streaming mode. It does not consume or produce Kafka records.
+
+Set the following in a deployment-specific configuration to run dataset mode:
+
+```yaml
+mode: "dataset"
+dataset:
+  parquet_key: "dataset/iot-telemetry-<start-epoch-ms>.parquet"
+  s3_endpoint_url: "http://192.168.1.50:9000"
+  s3_bucket_name: "iotsim"
+  s3_access_key: "access"
+  s3_secret_key: "secret"
+```
+
+The run exits after the full dataset has been evaluated. It writes every final
+model result (normal and anomalous) to
+`iotsim/results/<dataset-name>-results.parquet`, logs anomalous detections, and
+reports final counts. The Parquet rows include model identity, input list,
+window counts, anomaly state and score, and JSON-encoded details. Use `ANOMALY_DETECT__DATASET__S3_ACCESS_KEY` and
+`ANOMALY_DETECT__DATASET__S3_SECRET_KEY` to keep credentials out of YAML.

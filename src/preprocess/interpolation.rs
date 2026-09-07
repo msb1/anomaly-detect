@@ -8,13 +8,13 @@ pub enum InterpolationResult {
 }
 
 /// Returns synthetic points followed by the real current point. The gap
-/// fraction measures missing event time (`delta - expected interval`) against
-/// the full configured sliding-window duration.
+/// fraction measures missing points against the configured sliding-window
+/// sample count.
 pub fn bounded_linear(
     previous: Option<Sample>,
     current: Sample,
     interval_ms: i64,
-    window_duration_ms: i64,
+    window_sample_count: usize,
     config: &InterpolationConfig,
 ) -> InterpolationResult {
     let Some(previous) = previous else {
@@ -28,14 +28,13 @@ pub fn bounded_linear(
     if delta <= interval_ms {
         return InterpolationResult::Samples(vec![current]);
     }
-    let missing_duration = delta.saturating_sub(interval_ms);
-    let maximum_missing_duration =
-        (window_duration_ms as f64 * config.max_gap_fraction).floor() as i64;
-    if missing_duration > maximum_missing_duration {
+    let missing_points = (delta - 1) / interval_ms;
+    let maximum_missing_points =
+        (window_sample_count as f64 * config.max_gap_fraction).round() as i64;
+    if missing_points > maximum_missing_points {
         return InterpolationResult::GapLimitExceeded;
     }
 
-    let missing_points = (delta - 1) / interval_ms;
     let mut samples = Vec::with_capacity(usize::try_from(missing_points + 1).unwrap_or(1));
     for step in 1..=missing_points {
         let elapsed = step.saturating_mul(interval_ms);
@@ -72,7 +71,7 @@ mod tests {
             value: 6.0,
         };
         let InterpolationResult::Samples(samples) =
-            bounded_linear(Some(previous), current, 1_000, 10_000, &config())
+            bounded_linear(Some(previous), current, 1_000, 10, &config())
         else {
             panic!("gap should be interpolated");
         };
@@ -87,7 +86,7 @@ mod tests {
                 value: 6.0,
             },
             1_000,
-            10_000,
+            10,
             &config(),
         );
         assert_eq!(too_large, InterpolationResult::GapLimitExceeded);

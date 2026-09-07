@@ -29,7 +29,10 @@ impl Pipeline {
         Ok(Self {
             streams: config.streams.clone(),
             windows: WindowStore::new(&config.streams, &config.window, &config.preprocessing),
-            models: ModelCoordinator::new(config.models.clone())?,
+            models: ModelCoordinator::with_preprocessing(
+                config.models.clone(),
+                &config.preprocessing,
+            )?,
         })
     }
 
@@ -63,7 +66,7 @@ impl Pipeline {
         let mut reset = Vec::new();
         let mut interpolated = BTreeMap::new();
         for stream in matched_streams {
-            match self.windows.push(&stream, sample) {
+            match self.windows.push(&stream, sample, message.interval_ms) {
                 Some(WindowUpdate::Accepted {
                     interpolated_points,
                     window_cleared,
@@ -83,10 +86,10 @@ impl Pipeline {
         if !reset.is_empty() {
             self.models.reset_for_streams(&reset)?;
         }
-        let ready_model_indices = self.models.ready_model_indices(&accepted, |input| {
+        let ready_model_indices = self.models.ready_model_indices(&accepted, |input, kind| {
             self.windows
                 .get(input)
-                .is_some_and(|window| window.is_primed())
+                .is_some_and(|window| window.is_primed(kind))
         });
         let mut ready_models = Vec::with_capacity(ready_model_indices.len());
         let mut detections = Vec::new();
@@ -99,7 +102,7 @@ impl Pipeline {
                     let samples = self
                         .windows
                         .get(name)
-                        .and_then(|window| window.processed_samples())
+                        .and_then(|window| window.processed_samples(config.kind))
                         .ok_or_else(|| {
                             ModelError::new(format!(
                                 "model '{}' input stream '{name}' is not processed and primed",
@@ -145,7 +148,6 @@ mod tests {
 
     fn config() -> AppConfig {
         let stream = |metric: &str| StreamConfig {
-            interval_ms: 1,
             headers: BTreeMap::from([
                 ("entity_id".into(), "tank-1".into()),
                 ("sensor_id".into(), "sensor-1".into()),
@@ -154,6 +156,7 @@ mod tests {
             ]),
         };
         AppConfig {
+            mode: RunMode::Streaming,
             kafka: KafkaConfig {
                 brokers: "localhost:9092".into(),
                 topic: "telemetry".into(),
@@ -162,13 +165,11 @@ mod tests {
                 client_id: "client".into(),
                 auto_offset_reset: "latest".into(),
                 invalid_message_policy: InvalidMessagePolicy::Skip,
+                logging: KafkaLoggingConfig::default(),
                 security: KafkaSecurityConfig::default(),
             },
-            window: WindowConfig {
-                duration_ms: 10,
-                minimum_samples: 2,
-                max_lateness_ms: 0,
-            },
+            dataset: DatasetConfig::default(),
+            window: WindowConfig { sample_count: 4 },
             preprocessing: PreprocessingConfig::default(),
             streams: BTreeMap::from([
                 ("temperature".into(), stream("temperature_c")),
@@ -200,6 +201,7 @@ mod tests {
             sensor_id: "sensor-1".into(),
             sensor_type: "weather".into(),
             timestamp_ms,
+            interval_ms: 1,
             metric: metric.into(),
             value: 20.0,
         }
@@ -215,7 +217,7 @@ mod tests {
     #[test]
     fn multivariate_model_waits_for_every_input_window() {
         let mut pipeline = Pipeline::new(&config()).unwrap();
-        for timestamp in [0, 10] {
+        for timestamp in [0, 10, 20, 30] {
             let headers = config().streams["temperature"].headers.clone();
             let matches = pipeline.matching_streams(&headers);
             assert!(
@@ -226,13 +228,13 @@ mod tests {
                     .is_empty()
             );
         }
-        for timestamp in [0, 10] {
+        for timestamp in [0, 10, 20, 30] {
             let headers = config().streams["humidity"].headers.clone();
             let matches = pipeline.matching_streams(&headers);
             let outcome = pipeline
                 .ingest(matches, &headers, message("humidity_pct", timestamp))
                 .unwrap();
-            if timestamp == 10 {
+            if timestamp == 30 {
                 assert_eq!(outcome.ready_models[0].id, "weather-context");
             }
         }

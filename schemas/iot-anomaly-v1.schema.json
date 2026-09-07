@@ -23,7 +23,7 @@
     "model_id": { "type": "string", "minLength": 1 },
     "model_kind": { "enum": ["univariate", "multivariate"] },
     "algorithm": { "type": "string", "minLength": 1 },
-    "score_algorithm": { "enum": ["z_score", "mad"] },
+    "score_algorithm": { "enum": ["z_score", "mad", "raw"] },
     "inputs": {
       "type": "array",
       "minItems": 1,

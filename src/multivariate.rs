@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use nalgebra::DVector;
 use serde_json::Value;
 
-use crate::config::{ModelConfig, ModelKind};
+use crate::config::{
+    DecompositionConfig, ModelConfig, ModelKind, PreprocessingConfig, SmoothingConfig,
+};
 use crate::model::{AnomalyModel, Detection, ModelError, ModelInput};
 
 use self::gsta::{GstaDetector, GstaUpdate, aligned_channel_window};
@@ -124,12 +126,19 @@ struct MultivariateModel {
     max_time_skew_ms: i64,
     engine_config: EngineConfig,
     engine: Engine,
-    score_pipeline: ScorePipeline,
+    score_pipeline: Option<ScorePipeline>,
+    score_detector_enabled: bool,
+    threshold: f64,
+    window_size: usize,
     last_timestamps: Option<Vec<i64>>,
 }
 
 impl MultivariateModel {
-    fn from_config(config: &ModelConfig) -> Result<Self, ModelError> {
+    fn from_config(
+        config: &ModelConfig,
+        decomposition: &DecompositionConfig,
+        smoothing: &SmoothingConfig,
+    ) -> Result<Self, ModelError> {
         if config.kind != ModelKind::Multivariate {
             return Err(ModelError::new(format!(
                 "model '{}' is not multivariate",
@@ -137,6 +146,27 @@ impl MultivariateModel {
             )));
         }
         let window_size = usize_value(config, "window_size", None)?;
+        let score_detector_enabled = match config.parameters.get("score_detector_enabled") {
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(ModelError::new(format!(
+                    "model '{}' parameters.score_detector_enabled must be boolean",
+                    config.id
+                )));
+            }
+            None => true,
+        };
+        let threshold = config
+            .thresholds
+            .get("score")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| {
+                ModelError::new(format!(
+                    "model '{}' requires a positive thresholds.score",
+                    config.id
+                ))
+            })?;
         let max_time_skew_ms = i64::try_from(usize_value(config, "max_time_skew_ms", None)?)
             .map_err(|_| ModelError::new("max_time_skew_ms is too large"))?;
         let engine_config = match config.algorithm.as_str() {
@@ -202,7 +232,12 @@ impl MultivariateModel {
             max_time_skew_ms,
             engine_config,
             engine,
-            score_pipeline: ScorePipeline::new(config)?,
+            score_pipeline: score_detector_enabled
+                .then(|| ScorePipeline::new(config, decomposition, smoothing))
+                .transpose()?,
+            score_detector_enabled,
+            threshold,
+            window_size,
             last_timestamps: None,
         })
     }
@@ -291,8 +326,27 @@ impl MultivariateModel {
         let Some(raw_score) = raw_score else {
             return Ok(None);
         };
-        let Some(mut detection) = self.score_pipeline.update(maximum_timestamp, raw_score)? else {
-            return Ok(None);
+        let mut detection = if let Some(score_pipeline) = &mut self.score_pipeline {
+            let Some(detection) = score_pipeline.update(maximum_timestamp, raw_score)? else {
+                return Ok(None);
+            };
+            detection
+        } else {
+            if !raw_score.is_finite() {
+                return Err(ModelError::new("multivariate score must be finite"));
+            }
+            Detection {
+                model_id: self.id.clone(),
+                timestamp_ms: maximum_timestamp,
+                anomalous: raw_score > self.threshold,
+                score: Some(raw_score),
+                anomalous_points: usize::from(raw_score > self.threshold),
+                window_sample_count: self.window_size,
+                details: std::collections::BTreeMap::from([
+                    ("threshold".into(), Value::from(self.threshold)),
+                    ("score_detector_enabled".into(), Value::from(false)),
+                ]),
+            }
         };
 
         let score_name = match self.algorithm.as_str() {
@@ -310,6 +364,10 @@ impl MultivariateModel {
         detection
             .details
             .insert("multivariate_score".into(), Value::from(raw_score));
+        detection.details.insert(
+            "score_detector_enabled".into(),
+            Value::from(self.score_detector_enabled),
+        );
         detection.details.insert(
             "input_values".into(),
             Value::Object(
@@ -363,7 +421,9 @@ impl MultivariateModel {
 
     fn reset(&mut self) -> Result<(), ModelError> {
         self.engine = Engine::new(&self.engine_config)?;
-        self.score_pipeline.clear();
+        if let Some(score_pipeline) = &mut self.score_pipeline {
+            score_pipeline.clear()?;
+        }
         self.last_timestamps = None;
         Ok(())
     }
@@ -379,9 +439,39 @@ pub struct SharedMultivariateModel {
 
 impl SharedMultivariateModel {
     pub fn from_config(config: &ModelConfig) -> Result<Self, ModelError> {
+        Self::from_config_with_preprocessing(config, &PreprocessingConfig::default())
+    }
+
+    pub fn from_config_with_decomposition(
+        config: &ModelConfig,
+        decomposition: &DecompositionConfig,
+    ) -> Result<Self, ModelError> {
+        Self::from_config_with_parts(config, decomposition, &SmoothingConfig::default())
+    }
+
+    pub fn from_config_with_preprocessing(
+        config: &ModelConfig,
+        preprocessing: &PreprocessingConfig,
+    ) -> Result<Self, ModelError> {
+        Self::from_config_with_parts(
+            config,
+            &preprocessing.decomposition,
+            &preprocessing.smoothing,
+        )
+    }
+
+    fn from_config_with_parts(
+        config: &ModelConfig,
+        decomposition: &DecompositionConfig,
+        smoothing: &SmoothingConfig,
+    ) -> Result<Self, ModelError> {
         Ok(Self {
             id: config.id.clone(),
-            inner: Arc::new(Mutex::new(MultivariateModel::from_config(config)?)),
+            inner: Arc::new(Mutex::new(MultivariateModel::from_config(
+                config,
+                decomposition,
+                smoothing,
+            )?)),
         })
     }
 
@@ -457,6 +547,20 @@ mod tests {
     }
 
     #[test]
+    fn retains_day_of_week_as_a_multivariate_coordinate() {
+        let mut config = config();
+        config.inputs = vec!["left".into(), "right".into(), "rack_day_of_week".into()];
+        config
+            .parameters
+            .insert("window_size".into(), Value::from(4));
+        let model = SharedMultivariateModel::from_config(&config).unwrap();
+        assert_eq!(
+            model.inner.lock().unwrap().inputs,
+            ["left", "right", "rack_day_of_week"]
+        );
+    }
+
+    #[test]
     fn advances_only_after_every_input_has_a_fresh_aligned_value() {
         let model = SharedMultivariateModel::from_config(&config()).unwrap();
         let left = samples(1, 0.0);
@@ -515,5 +619,43 @@ mod tests {
             Value::from("mahalanobis_distance")
         );
         assert!(detection.details["multivariate_score"].as_f64().unwrap() > 10.0);
+    }
+
+    #[test]
+    fn can_emit_raw_multivariate_scores_without_second_stage_scoring() {
+        let mut config = config();
+        config
+            .parameters
+            .insert("score_detector_enabled".into(), Value::from(false));
+        config.parameters.remove("score_detector");
+        config.parameters.remove("score_window_size");
+        let model = SharedMultivariateModel::from_config(&config).unwrap();
+        let mut detection = None;
+        for (timestamp, values) in [
+            (1, [0.0, 0.0]),
+            (2, [0.1, 0.1]),
+            (3, [-0.1, -0.1]),
+            (4, [8.0, -8.0]),
+        ] {
+            let left = samples(timestamp, values[0]);
+            let right = samples(timestamp, values[1]);
+            detection = model
+                .evaluate_streams(ModelInput {
+                    streams: BTreeMap::from([("left", &left), ("right", &right)]),
+                })
+                .unwrap();
+        }
+        let detection = detection.expect("engine emits after its baseline is warm");
+        assert_eq!(
+            detection.score,
+            detection.details["multivariate_score"].as_f64()
+        );
+        assert_eq!(detection.details["score_detector_enabled"], false);
+        assert!(
+            detection
+                .details
+                .get("decomposed_multivariate_score")
+                .is_none()
+        );
     }
 }

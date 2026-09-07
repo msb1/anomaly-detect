@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::config::{ModelConfig, ModelKind};
+use crate::config::{ModelConfig, ModelKind, PreprocessingConfig};
 use crate::multivariate::SharedMultivariateModel;
 use crate::univariate::UnivariateModel;
 use crate::window::Sample;
@@ -60,6 +60,13 @@ struct RegisteredModel {
 
 impl ModelCoordinator {
     pub fn new(models: Vec<ModelConfig>) -> Result<Self, ModelError> {
+        Self::with_preprocessing(models, &PreprocessingConfig::default())
+    }
+
+    pub fn with_preprocessing(
+        models: Vec<ModelConfig>,
+        preprocessing: &PreprocessingConfig,
+    ) -> Result<Self, ModelError> {
         let models = models
             .into_iter()
             .map(|config| {
@@ -67,7 +74,12 @@ impl ModelCoordinator {
                     .then(|| UnivariateModel::from_config(&config))
                     .transpose()?;
                 let multivariate = (config.kind == ModelKind::Multivariate)
-                    .then(|| SharedMultivariateModel::from_config(&config))
+                    .then(|| {
+                        SharedMultivariateModel::from_config_with_preprocessing(
+                            &config,
+                            preprocessing,
+                        )
+                    })
                     .transpose()?;
                 Ok(RegisteredModel {
                     config,
@@ -82,7 +94,7 @@ impl ModelCoordinator {
     pub fn ready_model_indices(
         &self,
         changed_streams: &[String],
-        is_primed: impl Fn(&str) -> bool,
+        is_primed: impl Fn(&str, ModelKind) -> bool,
     ) -> Vec<usize> {
         self.models
             .iter()
@@ -94,7 +106,11 @@ impl ModelCoordinator {
                         .inputs
                         .iter()
                         .any(|input| changed_streams.contains(input))
-                    && model.config.inputs.iter().all(|input| is_primed(input))
+                    && model
+                        .config
+                        .inputs
+                        .iter()
+                        .all(|input| is_primed(input, model.config.kind))
             })
             .map(|(index, _)| index)
             .collect()
@@ -127,9 +143,13 @@ impl ModelCoordinator {
                 .inputs
                 .iter()
                 .any(|input| reset_streams.contains(input))
-                && let Some(multivariate) = &model.multivariate
             {
-                multivariate.reset()?;
+                if let Some(univariate) = &model.univariate {
+                    univariate.reset()?;
+                }
+                if let Some(multivariate) = &model.multivariate {
+                    multivariate.reset()?;
+                }
             }
         }
         Ok(())

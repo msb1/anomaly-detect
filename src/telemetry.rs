@@ -11,6 +11,7 @@ pub struct TelemetryMessage {
     pub sensor_id: String,
     pub sensor_type: String,
     pub timestamp_ms: i64,
+    pub interval_ms: i64,
     pub metric: String,
     pub value: f64,
 }
@@ -35,6 +36,9 @@ impl TelemetryMessage {
         }
         if !self.value.is_finite() {
             return Err(TelemetryError::NonFiniteValue);
+        }
+        if self.interval_ms <= 0 {
+            return Err(TelemetryError::InvalidInterval);
         }
         Ok(())
     }
@@ -78,4 +82,6 @@ pub enum TelemetryError {
     },
     #[error("telemetry value must be finite")]
     NonFiniteValue,
+    #[error("telemetry interval_ms must be positive")]
+    InvalidInterval,
 }

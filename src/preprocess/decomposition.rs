@@ -1,201 +1,250 @@
-use crate::config::StlConfig;
+use std::collections::VecDeque;
+use std::f64::consts::TAU;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Components {
-    pub trend: Vec<f64>,
-    pub seasonal: Vec<f64>,
-    pub remainder: Vec<f64>,
+use rustfft::{FftPlanner, num_complex::Complex};
+
+use crate::config::{DecompositionConfig, SeasonalDecompositionConfig};
+
+/// The causal decomposition of one observation using estimates available when
+/// that observation arrives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecompositionOutput {
+    pub trend: f64,
+    pub seasonal: f64,
+    pub remainder: f64,
+    pub period_samples: Option<usize>,
 }
 
-/// Robust STL-style additive decomposition. Trend and seasonal subseries are
-/// fitted with local-linear LOESS and Tukey bisquare robustness weights.
-pub fn stl(values: &[f64], period: usize, config: &StlConfig) -> Option<Components> {
-    if period < 2 || values.len() < period.saturating_mul(2) {
-        return None;
-    }
-    let mut robustness = vec![1.0; values.len()];
-    let mut components = None;
-    for iteration in 0..=config.robust_iterations {
-        let trend_span = next_odd(period.saturating_mul(2).saturating_add(1));
-        let trend = loess(values, trend_span, &robustness);
-        let detrended: Vec<f64> = values
-            .iter()
-            .zip(&trend)
-            .map(|(value, trend)| value - trend)
-            .collect();
-        let mut seasonal = vec![0.0; values.len()];
-        for phase in 0..period {
-            let indexes: Vec<usize> = (phase..values.len()).step_by(period).collect();
-            let phase_values: Vec<f64> = indexes.iter().map(|index| detrended[*index]).collect();
-            let phase_weights: Vec<f64> = indexes.iter().map(|index| robustness[*index]).collect();
-            let fitted = loess(&phase_values, config.loess_span, &phase_weights);
-            for (index, value) in indexes.into_iter().zip(fitted) {
-                seasonal[index] = value;
-            }
+/// Stateful streaming decomposition: Holt's linear method is applied first,
+/// then an exact sliding DFT identifies and removes repeating structure.
+#[derive(Debug, Clone)]
+pub struct StreamingDecomposer {
+    config: DecompositionConfig,
+    level: Option<f64>,
+    slope: f64,
+    seasonal: SlidingDft,
+    detected_period: Option<usize>,
+    samples_since_detection: usize,
+}
+
+impl StreamingDecomposer {
+    pub fn new(config: &DecompositionConfig) -> Self {
+        Self {
+            config: config.clone(),
+            level: None,
+            slope: 0.0,
+            seasonal: SlidingDft::new(config.seasonal.window_size_samples),
+            detected_period: None,
+            samples_since_detection: 0,
         }
-        let seasonal_mean = seasonal.iter().sum::<f64>() / seasonal.len() as f64;
-        seasonal
-            .iter_mut()
-            .for_each(|value| *value -= seasonal_mean);
-        let remainder: Vec<f64> = values
-            .iter()
-            .zip(&trend)
-            .zip(&seasonal)
-            .map(|((value, trend), seasonal)| value - trend - seasonal)
-            .collect();
-        components = Some(Components {
+    }
+
+    pub fn update(&mut self, value: f64) -> DecompositionOutput {
+        let trend = self.update_trend(value);
+        let detrended = value - trend;
+
+        let mut seasonal = 0.0;
+        if self.config.seasonal.enabled && self.seasonal.is_full() {
+            if self.detected_period.is_none()
+                || self.samples_since_detection >= self.config.seasonal.detection_interval_samples
+            {
+                self.detected_period = self.seasonal.dominant_period(&self.config.seasonal);
+                self.samples_since_detection = 0;
+            }
+            if let Some(period) = self.detected_period {
+                seasonal = self.seasonal.lagged(period).unwrap_or(0.0);
+            }
+            self.samples_since_detection += 1;
+        }
+        if self.config.seasonal.enabled {
+            self.seasonal.push(detrended);
+        }
+
+        DecompositionOutput {
             trend,
             seasonal,
-            remainder,
-        });
-        if iteration < config.robust_iterations {
-            robustness = robustness_weights(&components.as_ref()?.remainder);
+            remainder: detrended - seasonal,
+            period_samples: self.detected_period,
         }
     }
-    components
+
+    pub fn reset(&mut self) {
+        self.level = None;
+        self.slope = 0.0;
+        self.seasonal.clear();
+        self.detected_period = None;
+        self.samples_since_detection = 0;
+    }
+
+    fn update_trend(&mut self, value: f64) -> f64 {
+        if !self.config.trend.enabled {
+            return 0.0;
+        }
+        let Some(level) = self.level else {
+            self.level = Some(value);
+            return value;
+        };
+        let next_level = self.config.trend.alpha * value
+            + (1.0 - self.config.trend.alpha) * (level + self.slope);
+        let next_slope = self.config.trend.beta * (next_level - level)
+            + (1.0 - self.config.trend.beta) * self.slope;
+        self.level = Some(next_level);
+        self.slope = next_slope;
+        next_level + next_slope
+    }
 }
 
-/// Twitter AnomalyDetection-style median decomposition: a constant median
-/// trend plus a robust median seasonal profile for each phase.
-pub fn twitter(values: &[f64], period: usize) -> Option<Components> {
-    if period < 2 || values.len() < period.saturating_mul(2) {
-        return None;
-    }
-    let level = median(values);
-    let trend = vec![level; values.len()];
-    let mut phase_pattern = Vec::with_capacity(period);
-    for phase in 0..period {
-        let phase_values: Vec<f64> = (phase..values.len())
-            .step_by(period)
-            .map(|index| values[index] - level)
+/// Exact sliding DFT. The first complete window is initialized with RustFFT;
+/// each subsequent point updates all bins in O(N) from the outgoing and
+/// incoming values instead of recalculating an O(N log N) FFT.
+#[derive(Debug, Clone)]
+struct SlidingDft {
+    window_size: usize,
+    values: VecDeque<f64>,
+    spectrum: Vec<Complex<f64>>,
+    rotations: Vec<Complex<f64>>,
+}
+
+impl SlidingDft {
+    fn new(window_size: usize) -> Self {
+        let rotations = (0..window_size)
+            .map(|bin| Complex::from_polar(1.0, TAU * bin as f64 / window_size as f64))
             .collect();
-        phase_pattern.push(median(&phase_values));
+        Self {
+            window_size,
+            values: VecDeque::with_capacity(window_size),
+            spectrum: Vec::new(),
+            rotations,
+        }
     }
-    let center = median(&phase_pattern);
-    phase_pattern.iter_mut().for_each(|value| *value -= center);
-    let seasonal: Vec<f64> = (0..values.len())
-        .map(|index| phase_pattern[index % period])
-        .collect();
-    let remainder = values
-        .iter()
-        .zip(&trend)
-        .zip(&seasonal)
-        .map(|((value, trend), seasonal)| value - trend - seasonal)
-        .collect();
-    Some(Components {
-        trend,
-        seasonal,
-        remainder,
-    })
-}
 
-fn loess(values: &[f64], requested_span: usize, robustness: &[f64]) -> Vec<f64> {
-    if values.len() <= 2 {
-        return values.to_vec();
+    fn is_full(&self) -> bool {
+        self.values.len() == self.window_size
     }
-    let span = requested_span.clamp(3, values.len());
-    let half = span / 2;
-    (0..values.len())
-        .map(|center| {
-            let mut left = center.saturating_sub(half);
-            let right = (left + span).min(values.len());
-            left = right.saturating_sub(span);
-            let max_distance = (center - left).max(right - 1 - center).max(1) as f64;
-            let mut sum_w = 0.0;
-            let mut sum_wx = 0.0;
-            let mut sum_wxx = 0.0;
-            let mut sum_wy = 0.0;
-            let mut sum_wxy = 0.0;
-            for index in left..right {
-                let x = index as f64 - center as f64;
-                let distance = x.abs() / max_distance;
-                let tricube = (1.0 - distance.powi(3)).max(0.0).powi(3);
-                let weight = tricube * robustness[index];
-                sum_w += weight;
-                sum_wx += weight * x;
-                sum_wxx += weight * x * x;
-                sum_wy += weight * values[index];
-                sum_wxy += weight * x * values[index];
+
+    fn push(&mut self, value: f64) {
+        if !self.is_full() {
+            self.values.push_back(value);
+            if self.is_full() {
+                self.initialize_spectrum();
             }
-            let denominator = sum_w * sum_wxx - sum_wx * sum_wx;
-            if sum_w <= f64::EPSILON {
-                values[center]
-            } else if denominator.abs() <= f64::EPSILON {
-                sum_wy / sum_w
-            } else {
-                (sum_wxx * sum_wy - sum_wx * sum_wxy) / denominator
-            }
-        })
-        .collect()
-}
+            return;
+        }
 
-fn robustness_weights(remainder: &[f64]) -> Vec<f64> {
-    let absolute: Vec<f64> = remainder.iter().map(|value| value.abs()).collect();
-    let scale = 6.0 * median(&absolute);
-    if scale <= f64::EPSILON {
-        return vec![1.0; remainder.len()];
+        let outgoing = self
+            .values
+            .pop_front()
+            .expect("a full sliding DFT contains an outgoing value");
+        self.values.push_back(value);
+        for (rotation, spectrum) in self.rotations.iter().zip(self.spectrum.iter_mut()) {
+            *spectrum = *rotation * (*spectrum + Complex::new(value - outgoing, 0.0));
+        }
     }
-    remainder
-        .iter()
-        .map(|value| {
-            let ratio = value.abs() / scale;
-            if ratio >= 1.0 {
-                0.0
-            } else {
-                (1.0 - ratio * ratio).powi(2)
-            }
-        })
-        .collect()
-}
 
-fn median(values: &[f64]) -> f64 {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let middle = sorted.len() / 2;
-    if sorted.len().is_multiple_of(2) {
-        (sorted[middle - 1] + sorted[middle]) / 2.0
-    } else {
-        sorted[middle]
+    fn lagged(&self, period: usize) -> Option<f64> {
+        self.values
+            .get(self.values.len().checked_sub(period)?)
+            .copied()
     }
-}
 
-fn next_odd(value: usize) -> usize {
-    if value.is_multiple_of(2) {
-        value.saturating_add(1)
-    } else {
-        value
+    fn dominant_period(&self, config: &SeasonalDecompositionConfig) -> Option<usize> {
+        if !self.is_full() {
+            return None;
+        }
+        let minimum_bin = self.window_size.div_ceil(config.max_period_samples).max(1);
+        let maximum_bin = (self.window_size / config.min_period_samples).min(self.window_size / 2);
+        if minimum_bin > maximum_bin {
+            return None;
+        }
+        let dominant_bin = (minimum_bin..=maximum_bin).max_by(|left, right| {
+            self.spectrum[*left]
+                .norm_sqr()
+                .total_cmp(&self.spectrum[*right].norm_sqr())
+        })?;
+        Some(
+            ((self.window_size as f64 / dominant_bin as f64).round() as usize)
+                .clamp(config.min_period_samples, config.max_period_samples),
+        )
+    }
+
+    fn clear(&mut self) {
+        self.values.clear();
+        self.spectrum.clear();
+    }
+
+    fn initialize_spectrum(&mut self) {
+        let mut buffer: Vec<Complex<f64>> = self
+            .values
+            .iter()
+            .map(|value| Complex::new(*value, 0.0))
+            .collect();
+        FftPlanner::new()
+            .plan_fft_forward(self.window_size)
+            .process(&mut buffer);
+        self.spectrum = buffer;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{SeasonalDecompositionConfig, TrendDecompositionConfig};
 
-    #[test]
-    fn twitter_removes_repeating_seasonality() {
-        let values = [10.0, 12.0, 10.0, 12.0, 10.0, 12.0];
-        let components = twitter(&values, 2).unwrap();
-        assert!(components.remainder.iter().all(|value| value.abs() < 1e-12));
+    fn seasonal_config(window_size_samples: usize) -> SeasonalDecompositionConfig {
+        SeasonalDecompositionConfig {
+            enabled: true,
+            window_size_samples,
+            detection_interval_samples: 1,
+            min_period_samples: 2,
+            max_period_samples: window_size_samples,
+        }
     }
 
     #[test]
-    fn stl_returns_finite_additive_components() {
-        let values: Vec<f64> = (0..24)
-            .map(|index| index as f64 * 0.1 + if index % 4 == 0 { 2.0 } else { 0.0 })
-            .collect();
-        let components = stl(
-            &values,
-            4,
-            &StlConfig {
-                loess_span: 5,
-                robust_iterations: 1,
-            },
-        )
-        .unwrap();
-        for (index, value) in values.iter().enumerate() {
-            let reconstructed =
-                components.trend[index] + components.seasonal[index] + components.remainder[index];
-            assert!((reconstructed - value).abs() < 1e-10);
+    fn sliding_update_matches_a_fresh_fft() {
+        let mut sliding = SlidingDft::new(8);
+        for value in 0..8 {
+            sliding.push(value as f64);
         }
+        sliding.push(8.0);
+        let incremental = sliding.spectrum.clone();
+        sliding.initialize_spectrum();
+        for (actual, expected) in incremental.iter().zip(&sliding.spectrum) {
+            assert!((*actual - *expected).norm() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn detects_and_removes_a_repeating_period() {
+        let config = DecompositionConfig {
+            trend: TrendDecompositionConfig::default(),
+            seasonal: seasonal_config(16),
+        };
+        let mut decomposer = StreamingDecomposer::new(&config);
+        let mut output = None;
+        for index in 0..33 {
+            output = Some(decomposer.update(if index % 4 < 2 { 3.0 } else { -3.0 }));
+        }
+        let output = output.unwrap();
+        assert_eq!(output.period_samples, Some(4));
+        assert!(output.remainder.abs() < 1e-9);
+    }
+
+    #[test]
+    fn reset_discards_holt_and_spectral_state() {
+        let config = DecompositionConfig {
+            trend: TrendDecompositionConfig {
+                enabled: true,
+                alpha: 0.2,
+                beta: 0.1,
+            },
+            seasonal: seasonal_config(8),
+        };
+        let mut decomposer = StreamingDecomposer::new(&config);
+        for value in 0..10 {
+            decomposer.update(value as f64);
+        }
+        decomposer.reset();
+        assert_eq!(decomposer.update(42.0).remainder, 0.0);
     }
 }

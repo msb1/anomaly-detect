@@ -7,6 +7,23 @@ Multivariate models form synchronized vectors, produce a scalar distance or
 reconstruction error, and send that scalar through Z-score or MAD for the final
 anomaly decision.
 
+## Detrending and deseasonality scope
+
+Holt detrending and sliding-DFT deseasonality are preprocessing stages for
+univariate anomaly scoring, not multivariate feature engineering. A direct
+univariate detector receives its metric residual after the configured stages.
+In contrast, Mahalanobis, PCA, kernel PCA, and GSTA receive raw metric
+coordinates after scaling and smoothing only. Their scalar output then becomes
+a univariate score stream and receives Holt/DFT processing and the configured
+smoother before Z-score or MAD.
+
+This design retains relationships such as correlated daily levels for the
+multivariate engine while removing predictable drift and periodicity only where
+the final scalar anomaly score is normalized. A model result exposes both
+`details.multivariate_score` (the engine's raw output) and
+`details.decomposed_multivariate_score` (the residual before scalar smoothing)
+and `details.smoothed_multivariate_score` (the value actually scored).
+
 ## Univariate models
 
 The univariate detectors are in `src/univariate/`. They are window-local: their
@@ -28,9 +45,9 @@ score > thresholds.score
 
 Equality is not anomalous. Detection details include the input, latest
 timestamp and value, score inputs, threshold, and sample count. The processed
-window may include interpolation, scaling, decomposition, and smoothing, so
-scores and thresholds refer to that final representation rather than
-necessarily to the source unit.
+window may include interpolation, scaling, Holt detrending, sliding-DFT
+deseasonality, and smoothing, so scores and thresholds refer to that final
+representation rather than necessarily to the source unit.
 
 Because the candidate point is included in the reference window, a large point
 can shift the mean, standard deviation, median, or MAD that scores it. This is
@@ -54,7 +71,7 @@ score = abs(x_latest - mean) / standard_deviation.
 - `ddof: 0` (the default) uses population standard deviation.
 - `ddof: 1` uses the familiar sample-standard-deviation denominator `n - 1`.
 
-It must be a non-negative integer and smaller than `window.minimum_samples`.
+It must be a non-negative integer and smaller than `window.sample_count`.
 At evaluation, there must be more than `ddof` actual samples.
 
 The score is two-sided because of the absolute deviation: unusually high and
@@ -91,8 +108,9 @@ For the window values,
 
 ```text
 center = median(xi)
-MAD = median(abs(xi - center))
-score = abs(x_latest - center) / MAD.
+raw_MAD = median(abs(xi - center))
+smoothed_MAD(t) = alpha * raw_MAD(t) + (1 - alpha) * smoothed_MAD(t-1)
+score = 0.6745 * abs(x_latest - center) / (smoothed_MAD + epsilon).
 ```
 
 The median has a 50% breakdown point: fewer than half the observations can be
@@ -100,16 +118,24 @@ arbitrarily extreme without making the estimator arbitrarily extreme. The MAD
 has the same robustness intuition, making this detector more reliable than a
 Z-score when isolated spikes or heavy-tailed residuals are expected.
 
-This implementation reports the raw ratio in median-absolute-deviation units;
-it does **not** multiply MAD by the normal-consistency constant (about 1.4826).
-Therefore a MAD threshold is not numerically interchangeable with a Z-score
-threshold. Choose it empirically for the signal and preprocessing path.
+The factor `0.6745` puts this modified score approximately on a standard-normal
+Z-score scale. `parameters.mad_ema_alpha` controls how quickly the denominator
+tracks changing dispersion and defaults to `0.05`. `parameters.epsilon` is a
+strictly positive noise floor (default `1e-6`) that keeps scores finite for
+discretized or constant signals. Set epsilon in the units of the fully
+preprocessed model input, typically around 5% to 10% of normal background
+noise, and tune the threshold empirically for the complete preprocessing path.
+Both settings are validated at startup: alpha must be in `(0, 1]` and epsilon
+must be finite and positive.
 
-MAD is less efficient than standard deviation for ideal Gaussian data and can
-be zero for discretized or highly constant signals. In a zero-MAD window, the
-implementation returns score 0 when the newest value equals the median and
-`+infinity` otherwise. Thus any differing point is anomalous under a finite
-threshold.
+The first evaluation after a model is primed (or after its input stream resets)
+uses `raw_MAD` as the EMA baseline. Subsequent evaluations update the baseline
+once per accepted stream point. The reset is intentional: carrying dispersion
+from a discarded window into a newly primed operating regime would defeat the
+noise-control benefit. A MAD detection includes `median_absolute_deviation`
+(raw MAD), `smoothed_mad`, `stabilized_mad`, `mad_ema_alpha`, and `epsilon` in
+its details so production tuning can distinguish a changing signal from a
+changing denominator.
 
 Example:
 
@@ -119,6 +145,7 @@ Example:
   kind: univariate
   algorithm: mad
   inputs: [tank_level]
+  parameters: { mad_ema_alpha: 0.05, epsilon: 0.1 }
   thresholds: { score: 4.0 }
 ```
 
@@ -130,6 +157,14 @@ Example:
 | Spikes, heavy tails, or occasional contaminated points | `mad` | Median-based location and scale resist isolated extremes. |
 | Strong seasonality or trend | Preprocess first, then either | Both are level/dispersion detectors, not seasonal models. |
 | Long regime changes | Revisit window and preprocessing choices | A rolling reference adapts, so persistent shifts can become normal. |
+
+For Holt tuning, increase `alpha` or `beta` when normal ramps are being
+misclassified as residual anomalies; decrease them when brief excursions are
+being absorbed too readily. For seasonal tuning, set period bounds using the
+source cadence and expected cycle duration, then inspect
+`detected_seasonal_period_samples` in multivariate result details to verify the
+selected period. During the initial seasonal window warm-up there is no seasonal
+subtraction, so calibrate alert latency with that stage included.
 
 Neither model establishes causality or detects every form of anomaly. Their
 usefulness depends on cadence, the window duration, missing-data policy,
@@ -158,20 +193,33 @@ letting it alter the mean, covariance, or principal directions used to score
 it.
 
 GSTA instead uses `window_size` as the temporal length of each complete aligned
-channel tensor and has a separate self-training warmup. In every engine, the
-raw scalar then enters a separate inclusive `score_window_size` window and is
-evaluated by `score_detector: z_score` or `score_detector: mad`. For
+channel tensor and has a separate self-training warmup. When the score detector
+is enabled, every engine's raw scalar is first passed through the configured
+Holt detrending and sliding-DFT deseasonality, then the configured causal
+smoother. The smoothed remainder then enters a separate inclusive
+`score_window_size` window and is evaluated by `score_detector: z_score` or
+`score_detector: mad`. Raw multivariate metric inputs themselves receive only
+scaling and smoothing; decomposition never alters their coordinates. For
 Mahalanobis/PCA the first final result appears after
 `window_size + score_window_size` accepted aligned vectors. For GSTA it appears
 after `warmup_steps + score_window_size` complete channel windows once source
 windows are primed. `thresholds.score` applies to this second-stage Z-score/MAD,
 not directly to distance or reconstruction error.
 
+Set `parameters.score_detector_enabled: false` to skip this second stage. The
+engine then emits as soon as its own baseline is ready, `Detection.score` and
+Kafka `anomaly_score` contain the raw distance/reconstruction error, and
+`thresholds.score` is compared directly with that raw value. Kafka reports
+`score_algorithm: raw` for this mode.
+
 The final `Detection` contains:
 
 - `score`: the Z-score or MAD ratio used for the anomaly decision;
 - `details.multivariate_score`: the raw Mahalanobis distance, reconstruction
   error, or GSTA MSE;
+- `details.decomposed_multivariate_score`: the residual before scalar smoothing;
+- `details.smoothed_multivariate_score`: the scalar value sent to the final
+  score window;
 - `details.multivariate_score_name`, `multivariate_algorithm`, input values,
   input timestamps, and (for RFF modes) the effective `rbf_gamma`.
 
@@ -363,8 +411,7 @@ recalibration.
 ## Gated Self-Training Autoencoder (`gsta`)
 
 GSTA consumes a tensor shaped `[1, input_count, window_size]`. Input streams
-must have identical `interval_ms` values, and the complete temporal span must
-fit inside `window.duration_ms`. Every corresponding channel position must be
+must be positionally aligned. Every corresponding channel position must be
 within `max_time_skew_ms`; otherwise that update waits for alignment.
 
 The encoder applies `input_count -> 64 -> latent_channels` same-padded Conv1d
@@ -417,10 +464,13 @@ stream reset begins a seeded fresh warmup.
 | --- | --- | --- |
 | `window_size` | all | Fixed baseline count for point engines or temporal length for GSTA; at least 2, greater than input count for Mahalanobis, and must fit the event-time window for GSTA. |
 | `max_time_skew_ms` | all | Maximum cross-channel skew in one vector, or at each temporal position for GSTA. |
-| `score_detector` | all | `z_score` or `mad`. |
-| `score_window_size` | all | Fixed raw-score window; at least 2. |
+| `score_detector_enabled` | all | Defaults to `true`. When false, emit and threshold the raw engine score directly; `score_detector`, `score_window_size`, and `score_ddof` are not required. |
+| `score_detector` | score detector enabled | `z_score` or `mad`. |
+| `score_window_size` | score detector enabled | Fixed raw-score window; at least 2. |
 | `score_ddof` | Z-score stage | Defaults to 0 and must be less than `score_window_size`. |
-| `thresholds.score` | all | Finite positive threshold for the final Z-score/MAD ratio. |
+| `mad_ema_alpha` | Direct `mad` model | Raw-MAD EMA weight; defaults to `0.05` and must be in `(0, 1]`. |
+| `epsilon` | Direct `mad` model | Positive MAD denominator noise floor in the fully preprocessed input's units; defaults to `1e-6`. |
+| `thresholds.score` | all | Finite positive threshold for the final Z-score/MAD ratio, or the raw engine score when `score_detector_enabled: false`. |
 | `regularization` | Mahalanobis | Positive diagonal ridge; defaults to `1e-6`. |
 | `shrinkage` | Mahalanobis | Spherical covariance shrinkage in `[0, 1]`; defaults to 0. |
 | `retained_components` | PCA/kernel PCA | Positive count below `min(window_size, working_dimension)`. |

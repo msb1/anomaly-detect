@@ -4,10 +4,11 @@ The preprocessing subsystem converts each stream's retained raw event-time
 window into a derived window for anomaly detection. It is implemented in
 `src/preprocess/` and coordinated by `Preprocessor` and `WindowStore`.
 
-Every configured stream is processed independently. Therefore all fitted
-quantities--minimum, mean, seasonal pattern, and smoothed values--are based
-only on that stream's current window and never combine different units or
-metrics.
+Every configured stream is processed independently. Scaling and smoothing are
+shared preprocessing stages. Trend and seasonal decomposition are confined to
+univariate scoring: direct univariate metric models use them, multivariate
+metric inputs bypass them, and a multivariate model's scalar output uses them
+and the configured smoother before its final Z-score or MAD detector.
 
 ## Pipeline
 
@@ -19,27 +20,37 @@ Kafka record matching a stream
   -> bounded linear interpolation (optional)
   -> event-time insertion, lateness check, and window eviction
   -> scaling (optional)
-  -> seasonal-trend decomposition (optional)
-  -> smoothing (optional)
-  -> processed sliding window supplied to models
+  +-> multivariate metric view: smoothing (optional)
+  +-> univariate metric view: Holt detrending -> sliding-DFT deseasonality
+                              -> smoothing (optional)
 ```
 
-The configured transform order is always **scaling -> decomposition ->
-smoothing**. Interpolation occurs before a sample enters the window. After each
-accepted update, the derived window is rebuilt from the retained raw window;
-this is intentional, since expiry of an old sample changes window-local
-statistics and fits.
+For direct univariate detection the order is always **scaling -> detrending ->
+deseasonality -> smoothing**. For multivariate engine inputs it is **scaling ->
+smoothing**. The multivariate engine's scalar output then follows **detrending
+-> deseasonality -> smoothing -> Z-score/MAD**. Interpolation occurs before a sample enters
+either view.
 
-A stream is usable by a model only when its raw event-time span reaches
-`window.duration_ms`, it retains at least `window.minimum_samples`, and a
-processed view exists. If decomposition is enabled but cannot be fitted, no
-processed view is published.
+A stream is usable when it retains `window.sample_count` values. Seasonal
+decomposition emits the detrended value while its spectral window warms up, so
+it does not prevent metric-window priming.
+
+## MAD decision stability
+
+MAD is a detector-stage control rather than a preprocessing transform. Once a
+direct univariate residual window is primed, its raw MAD is smoothed per model
+with `parameters.mad_ema_alpha` (default `0.05`) and scored with
+`0.6745 * abs(remainder - median) / (smoothed_mad + epsilon)`. The positive
+`parameters.epsilon` floor (default `1e-6`) is in the units emitted by this
+preprocessing pipeline; choose it from normal residual noise, commonly 5% to
+10%. On a stream reset, the MAD EMA is reset along with the derived window, so
+the next fully primed window establishes a fresh dispersion baseline.
 
 ## Event-time windowing and gaps
 
 Raw samples are stored timestamp-ordered. The watermark is the greatest event
-time observed, and points older than `watermark - window.duration_ms` are
-evicted. A point older than `watermark - max_lateness_ms` is rejected as late.
+time observed; older arrivals are rejected and the oldest samples are evicted
+when the deque exceeds `window.sample_count`.
 
 For expected cadence `h = interval_ms`, successive forward observations at
 times `t0` and `t1` have missing event time
@@ -48,10 +59,10 @@ times `t0` and `t1` have missing event time
 g = t1 - t0 - h
 ```
 
-With interpolation enabled, the gap is filled only if
-`g <= floor(window.duration_ms * max_gap_fraction)`. Configuration requires a
-positive fraction no greater than 0.20. For an allowed gap, synthetic points
-are inserted at cadence times `t0 + k h` using
+With interpolation enabled, the gap is filled only when the number of missing
+samples does not exceed `round(window.sample_count * max_gap_fraction)`.
+Configuration requires a positive fraction no greater than 0.20. For an
+allowed gap, synthetic points are inserted at cadence times `t0 + k h` using
 
 ```text
 x(t0 + k h) = x0 + (k h / (t1 - t0)) * (x1 - x0).
@@ -100,7 +111,7 @@ sensitive to outliers. If `sigma <= epsilon`, all outputs are zero.
 `epsilon` must be finite and positive; output bounds must be finite with
 `output_min < output_max`.
 
-## Additive decomposition
+## Streaming decomposition
 
 When enabled, decomposition models the scaled series as
 
@@ -109,48 +120,74 @@ observed_t = trend_t + seasonal_t + remainder_t.
 ```
 
 Only `remainder_t = observed_t - trend_t - seasonal_t` proceeds downstream.
-The period in samples is the rounded-up conversion
-`ceil(period_ms / interval_ms)`; the implementation requires at least two
-samples per period and at least two full periods in the retained window.
+Trend and seasonal stages have independent `enabled` flags.
 
-### STL-style decomposition (`stl`)
+### Holt linear detrending
 
-The STL-style method estimates a smooth trend using local-linear LOESS across
-time. Neighbors receive tricube distance weights
+Holt's double exponential smoother tracks a level `l` and slope `b`:
 
 ```text
-w(d) = (1 - d^3)^3,  0 <= d <= 1,
+l_t = alpha * x_t + (1 - alpha) * (l_(t-1) + b_(t-1))
+b_t = beta * (l_t - l_(t-1)) + (1 - beta) * b_(t-1)
+trend_t = l_t + b_t
 ```
 
-combined with a robustness weight. After detrending, each seasonal phase
-(`index mod period`) is smoothed with local-linear LOESS using `loess_span`.
-The seasonal component is centered to mean zero so that the baseline belongs to
-the trend rather than seasonality.
+Both coefficients must be in `(0, 1]`. Tracking velocity lets the trend move
+with a ramp instead of introducing the fixed phase delay of SMA/EMA
+detrending.
 
-Robust passes reduce the effect of unusual residuals. Their Tukey-bisquare
-weights are based on `c = 6 * median(|remainder|)`:
+### Sliding DFT deseasonality
+
+The detrended stream fills `window_size_samples`. RustFFT initializes the first
+frequency spectrum. For every later sample the exact sliding DFT updates each
+bin from only the discarded and incoming values, making steady-state spectrum
+maintenance O(N) per point. The dominant non-DC frequency is searched within
+the configured period bounds every `detection_interval_samples`. The matching
+phase-aligned lagged detrended value is the seasonal estimate. Before the
+spectral window is full, the seasonal estimate is zero.
+
+For a window of `N` detrended values and frequency bin `k`, the initialized
+spectrum is the ordinary DFT
 
 ```text
-u = |remainder| / c
-robust_weight = (1 - u^2)^2  if u < 1; otherwise 0.
+X_k = sum(x_j * exp(-i * 2π * k * j / N)),  j = 0..N-1.
 ```
 
-The procedure runs the initial fit plus `robust_iterations` reweighted fits.
-`loess_span` must be odd and at least 3. This method accommodates a changing
-trend and repeating seasonal behavior; its quality depends on having enough
-periods and representative phase observations.
+When `x_old` leaves and `x_new` arrives, the implementation updates that bin
+exactly as
 
-### Median seasonal decomposition (`twitter`)
+```text
+X'_k = exp(i * 2π * k / N) * (X_k + x_new - x_old).
+```
 
-The `twitter` method is a robust, simpler seasonal baseline. It uses the global
-window median as a constant trend. For each phase of the period it takes the
-median value after subtracting that level, centers the phase profile by its
-median, repeats the profile across the window, and computes the remainder.
+This is why the steady-state update is O(N): it updates `N` retained bins, not
+an O(N log N) transform over the whole history. The initial FFT is only used
+when the spectral window first becomes full (and after a reset). Bin zero is
+ignored because it represents the remaining DC level; candidate bins are
+limited by the configured period bounds. If the selected bin is `k`, the
+reported period is `round(N / k)` samples and the seasonal estimate for the
+new point is the detrended observation one such period behind.
 
-Medians have high resistance to isolated extremes, so this works well for a
-stable-level signal with consistent periodic behavior. Unlike STL, its trend is
-constant within a window; a genuine drift can therefore remain in the
-remainder.
+The algorithm is causal: it never revises earlier residuals using future data.
+Consequently, period changes take one spectral window plus the configured
+detection interval to settle. Very broad period bounds can choose noise; use
+domain cadence and known cycle lengths to make them narrow.
+
+## Scope and state ownership
+
+`WindowStore` keeps one `StreamingDecomposer` per metric stream only when at
+least one decomposition stage is enabled. It receives each newly scaled input
+once, including bounded interpolation points. It is reset with the stream after
+an excessive interpolation gap.
+
+Each multivariate model owns a separate `StreamingDecomposer` inside its final
+score pipeline. It sees only that model's scalar distance, reconstruction
+error, or MSE, and resets whenever the multivariate baseline resets. This
+separation is intentional: sharing seasonal state between raw metric streams
+and model scores would make unrelated models affect one another.
+
+Raw multivariate metric views never instantiate or advance decomposition state.
+They use scaling and the configured smoother only.
 
 ## Smoothing
 
@@ -191,13 +228,15 @@ preprocessing:
     output_max: 1.0  # used by min_max
     epsilon: 1.0e-12
   decomposition:
-    enabled: false
-    method: stl      # stl | twitter
-    period_ms: 86400000
-    stl: { loess_span: 7, robust_iterations: 2 }
+    trend: { enabled: true, alpha: 0.2, beta: 0.1 }
+    seasonal:
+      enabled: true
+      window_size_samples: 256
+      detection_interval_samples: 1
+      min_period_samples: 2
+      max_period_samples: 128
   smoothing:
     enabled: true
     method: moving_average # moving_average | exponential_moving_average
     window_size: 5
 ```
-

@@ -9,6 +9,7 @@
     "sensor_id",
     "sensor_type",
     "timestamp_ms",
+    "interval_ms",
     "metric",
     "value"
   ],
@@ -18,9 +19,9 @@
     "sensor_id": { "type": "string" },
     "sensor_type": { "type": "string" },
     "timestamp_ms": { "type": "integer" },
+    "interval_ms": { "type": "integer", "minimum": 1 },
     "metric": { "type": "string" },
     "value": { "type": "number" }
   },
   "additionalProperties": false
 }
-

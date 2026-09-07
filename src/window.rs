@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::config::{PreprocessingConfig, StreamConfig, WindowConfig};
+use crate::config::{ModelKind, PreprocessingConfig, StreamConfig, WindowConfig};
 use crate::preprocess::Preprocessor;
+use crate::preprocess::decomposition::StreamingDecomposer;
 use crate::preprocess::interpolation::InterpolationResult;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,10 +22,7 @@ pub enum WindowUpdate {
 
 #[derive(Debug, Clone)]
 pub struct TimeWindow {
-    duration_ms: i64,
-    minimum_samples: usize,
-    max_lateness_ms: i64,
-    first_observed_ms: Option<i64>,
+    sample_count: usize,
     watermark_ms: Option<i64>,
     samples: VecDeque<Sample>,
 }
@@ -32,23 +30,20 @@ pub struct TimeWindow {
 impl TimeWindow {
     pub fn new(config: &WindowConfig) -> Self {
         Self {
-            duration_ms: config.duration_ms,
-            minimum_samples: config.minimum_samples,
-            max_lateness_ms: config.max_lateness_ms,
-            first_observed_ms: None,
+            sample_count: config.sample_count,
             watermark_ms: None,
             samples: VecDeque::new(),
         }
     }
 
     pub fn push(&mut self, sample: Sample) -> WindowUpdate {
-        if let Some(watermark) = self.watermark_ms
-            && sample.timestamp_ms < watermark.saturating_sub(self.max_lateness_ms)
+        if self
+            .watermark_ms
+            .is_some_and(|watermark| sample.timestamp_ms < watermark)
         {
             return WindowUpdate::TooLate;
         }
 
-        self.first_observed_ms.get_or_insert(sample.timestamp_ms);
         self.watermark_ms = Some(self.watermark_ms.map_or(sample.timestamp_ms, |current| {
             current.max(sample.timestamp_ms)
         }));
@@ -60,15 +55,7 @@ impl TimeWindow {
             .unwrap_or(self.samples.len());
         self.samples.insert(index, sample);
 
-        let cutoff = self
-            .watermark_ms
-            .expect("watermark was just set")
-            .saturating_sub(self.duration_ms);
-        while self
-            .samples
-            .front()
-            .is_some_and(|oldest| oldest.timestamp_ms < cutoff)
-        {
+        while self.samples.len() > self.sample_count {
             self.samples.pop_front();
         }
         WindowUpdate::Accepted {
@@ -78,13 +65,7 @@ impl TimeWindow {
     }
 
     pub fn is_primed(&self) -> bool {
-        match (self.first_observed_ms, self.watermark_ms) {
-            (Some(first), Some(watermark)) => {
-                watermark.saturating_sub(first) >= self.duration_ms
-                    && self.samples.len() >= self.minimum_samples
-            }
-            _ => false,
-        }
+        self.samples.len() >= self.sample_count
     }
 
     pub fn samples(&self) -> &VecDeque<Sample> {
@@ -92,7 +73,6 @@ impl TimeWindow {
     }
 
     fn clear(&mut self) {
-        self.first_observed_ms = None;
         self.watermark_ms = None;
         self.samples.clear();
     }
@@ -112,14 +92,18 @@ impl WindowStore {
     ) -> Self {
         Self {
             windows: streams
-                .iter()
-                .map(|(name, stream)| {
+                .keys()
+                .map(|name| {
                     (
                         name.clone(),
                         StreamWindow {
-                            interval_ms: stream.interval_ms,
                             raw: TimeWindow::new(window),
-                            processed: None,
+                            univariate: None,
+                            multivariate: None,
+                            decomposed: VecDeque::with_capacity(window.sample_count),
+                            decomposer: StreamingDecomposer::new(&preprocessing.decomposition),
+                            decomposition_enabled: preprocessing.decomposition.enabled(),
+                            sample_count: window.sample_count,
                         },
                     )
                 })
@@ -128,18 +112,18 @@ impl WindowStore {
         }
     }
 
-    pub fn push(&mut self, stream: &str, sample: Sample) -> Option<WindowUpdate> {
+    pub fn push(&mut self, stream: &str, sample: Sample, interval_ms: i64) -> Option<WindowUpdate> {
         let window = self.windows.get_mut(stream)?;
         let interpolation = self.preprocessor.interpolation(
             window.raw.samples().back().copied(),
             sample,
-            window.interval_ms,
+            interval_ms,
         );
         let (samples, window_cleared) = match interpolation {
             InterpolationResult::Samples(samples) => (samples, false),
             InterpolationResult::GapLimitExceeded => {
                 window.raw.clear();
-                window.processed = None;
+                window.clear_processed();
                 (vec![sample], true)
             }
         };
@@ -148,10 +132,31 @@ impl WindowStore {
             if matches!(window.raw.push(next), WindowUpdate::TooLate) {
                 return Some(WindowUpdate::TooLate);
             }
+            if window.decomposition_enabled {
+                let scaled = self
+                    .preprocessor
+                    .latest_scaled_value(window.raw.samples())
+                    .expect("a just-updated raw window contains one value");
+                let remainder = window.decomposer.update(scaled).remainder;
+                if window.decomposed.len() == window.sample_count {
+                    window.decomposed.pop_front();
+                }
+                window.decomposed.push_back(Sample {
+                    timestamp_ms: next.timestamp_ms,
+                    value: remainder,
+                });
+            }
         }
-        window.processed = self
-            .preprocessor
-            .transform(window.raw.samples(), window.interval_ms);
+        window.multivariate = Some(
+            self.preprocessor
+                .transform_multivariate(window.raw.samples()),
+        );
+        window.univariate = Some(if window.decomposition_enabled {
+            self.preprocessor.smooth_decomposed(&window.decomposed)
+        } else {
+            self.preprocessor
+                .transform_univariate_without_decomposition(window.raw.samples())
+        });
         Some(WindowUpdate::Accepted {
             interpolated_points,
             window_cleared,
@@ -165,35 +170,46 @@ impl WindowStore {
 
 #[derive(Debug)]
 pub struct StreamWindow {
-    interval_ms: i64,
     raw: TimeWindow,
-    processed: Option<VecDeque<Sample>>,
+    univariate: Option<VecDeque<Sample>>,
+    multivariate: Option<VecDeque<Sample>>,
+    decomposed: VecDeque<Sample>,
+    decomposer: StreamingDecomposer,
+    decomposition_enabled: bool,
+    sample_count: usize,
 }
 
 impl StreamWindow {
-    pub fn is_primed(&self) -> bool {
-        self.raw.is_primed() && self.processed.is_some()
+    pub fn is_primed(&self, kind: ModelKind) -> bool {
+        self.raw.is_primed() && self.processed_samples(kind).is_some()
     }
 
     pub fn raw_samples(&self) -> &VecDeque<Sample> {
         self.raw.samples()
     }
 
-    pub fn processed_samples(&self) -> Option<&VecDeque<Sample>> {
-        self.processed.as_ref()
+    pub fn processed_samples(&self, kind: ModelKind) -> Option<&VecDeque<Sample>> {
+        match kind {
+            ModelKind::Univariate => self.univariate.as_ref(),
+            ModelKind::Multivariate => self.multivariate.as_ref(),
+        }
+    }
+
+    fn clear_processed(&mut self) {
+        self.univariate = None;
+        self.multivariate = None;
+        self.decomposed.clear();
+        self.decomposer.reset();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TrendDecompositionConfig;
 
     fn config() -> WindowConfig {
-        WindowConfig {
-            duration_ms: 10_000,
-            minimum_samples: 2,
-            max_lateness_ms: 1_000,
-        }
+        WindowConfig { sample_count: 3 }
     }
 
     fn preprocessing() -> PreprocessingConfig {
@@ -201,31 +217,31 @@ mod tests {
     }
 
     #[test]
-    fn primes_only_after_full_time_span_and_evicts_expired_samples() {
+    fn primes_after_the_configured_sample_count_and_evicts_oldest_samples() {
         let mut window = TimeWindow::new(&config());
         window.push(Sample {
             timestamp_ms: 0,
             value: 1.0,
         });
         window.push(Sample {
-            timestamp_ms: 9_999,
+            timestamp_ms: 1,
             value: 2.0,
         });
         assert!(!window.is_primed());
         window.push(Sample {
-            timestamp_ms: 10_000,
+            timestamp_ms: 2,
             value: 3.0,
         });
         assert!(window.is_primed());
         window.push(Sample {
-            timestamp_ms: 12_000,
+            timestamp_ms: 3,
             value: 4.0,
         });
-        assert_eq!(window.samples().front().unwrap().timestamp_ms, 9_999);
+        assert_eq!(window.samples().front().unwrap().timestamp_ms, 1);
     }
 
     #[test]
-    fn sorts_allowed_late_data_and_rejects_data_behind_lateness_bound() {
+    fn rejects_out_of_order_data() {
         let mut window = TimeWindow::new(&config());
         window.push(Sample {
             timestamp_ms: 5_000,
@@ -236,19 +252,9 @@ mod tests {
                 timestamp_ms: 4_500,
                 value: 2.0
             }),
-            WindowUpdate::Accepted {
-                interpolated_points: 0,
-                window_cleared: false,
-            }
-        );
-        assert_eq!(
-            window.push(Sample {
-                timestamp_ms: 3_999,
-                value: 3.0
-            }),
             WindowUpdate::TooLate
         );
-        assert_eq!(window.samples().front().unwrap().timestamp_ms, 4_500);
+        assert_eq!(window.samples().front().unwrap().timestamp_ms, 5_000);
     }
 
     #[test]
@@ -257,7 +263,6 @@ mod tests {
             "metric".into(),
             StreamConfig {
                 headers: BTreeMap::new(),
-                interval_ms: 1_000,
             },
         )]);
         let mut preprocessing = preprocessing();
@@ -270,9 +275,15 @@ mod tests {
                     timestamp_ms,
                     value: timestamp_ms as f64,
                 },
+                1_000,
             );
         }
-        assert!(store.get("metric").unwrap().is_primed());
+        assert!(
+            store
+                .get("metric")
+                .unwrap()
+                .is_primed(ModelKind::Univariate)
+        );
         let update = store
             .push(
                 "metric",
@@ -280,6 +291,7 @@ mod tests {
                     timestamp_ms: 13_001,
                     value: 3.0,
                 },
+                1_000,
             )
             .unwrap();
         assert_eq!(
@@ -291,7 +303,7 @@ mod tests {
         );
         let window = store.get("metric").unwrap();
         assert_eq!(window.raw_samples().len(), 1);
-        assert!(!window.is_primed());
+        assert!(!window.is_primed(ModelKind::Univariate));
     }
 
     #[test]
@@ -300,18 +312,20 @@ mod tests {
             "metric".into(),
             StreamConfig {
                 headers: BTreeMap::new(),
-                interval_ms: 1_000,
             },
         )]);
         let mut preprocessing = preprocessing();
         preprocessing.interpolation.enabled = true;
-        let mut store = WindowStore::new(&streams, &config(), &preprocessing);
+        let mut point_config = config();
+        point_config.sample_count = 10;
+        let mut store = WindowStore::new(&streams, &point_config, &preprocessing);
         store.push(
             "metric",
             Sample {
                 timestamp_ms: 0,
                 value: 0.0,
             },
+            1_000,
         );
         let update = store
             .push(
@@ -320,6 +334,7 @@ mod tests {
                     timestamp_ms: 3_000,
                     value: 6.0,
                 },
+                1_000,
             )
             .unwrap();
         assert_eq!(
@@ -331,6 +346,51 @@ mod tests {
         );
         let window = store.get("metric").unwrap();
         assert_eq!(window.raw_samples().len(), 4);
-        assert_eq!(window.processed_samples().unwrap()[1].value, 2.0);
+        assert_eq!(
+            window.processed_samples(ModelKind::Univariate).unwrap()[1].value,
+            2.0
+        );
+    }
+
+    #[test]
+    fn multivariate_view_bypasses_univariate_decomposition() {
+        let streams = BTreeMap::from([(
+            "metric".into(),
+            StreamConfig {
+                headers: BTreeMap::new(),
+            },
+        )]);
+        let mut preprocessing = preprocessing();
+        preprocessing.decomposition.trend = TrendDecompositionConfig {
+            enabled: true,
+            alpha: 1.0,
+            beta: 1.0,
+        };
+        let mut store = WindowStore::new(&streams, &config(), &preprocessing);
+        for (timestamp_ms, value) in [(0, 1.0), (1, 2.0), (2, 3.0)] {
+            store.push(
+                "metric",
+                Sample {
+                    timestamp_ms,
+                    value,
+                },
+                1,
+            );
+        }
+        let window = store.get("metric").unwrap();
+        let multivariate: Vec<_> = window
+            .processed_samples(ModelKind::Multivariate)
+            .unwrap()
+            .iter()
+            .map(|sample| sample.value)
+            .collect();
+        let univariate: Vec<_> = window
+            .processed_samples(ModelKind::Univariate)
+            .unwrap()
+            .iter()
+            .map(|sample| sample.value)
+            .collect();
+        assert_eq!(multivariate, [1.0, 2.0, 3.0]);
+        assert_eq!(univariate, [0.0, -1.0, -1.0]);
     }
 }

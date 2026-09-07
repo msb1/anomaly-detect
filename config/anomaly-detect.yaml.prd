@@ -1,7 +1,3 @@
-# `streaming` consumes telemetry and emits results through Kafka. `dataset`
-# downloads one iot-sim Parquet object and replays it locally; it does not use Kafka.
-mode: "dataset"
-
 kafka:
   brokers: "192.168.1.50:9092,192.168.1.50:9094,192.168.1.50:9096"
   topic: "iot.telemetry.v1"
@@ -13,76 +9,70 @@ kafka:
   logging: { log_consumed_messages: true, log_produced_results: true }
   security: { security_protocol: null, sasl_mechanism: null, username: null, password: null }
 
-dataset:
-  parquet_key: "processed/water_hammer-2026-08-30T00:00:00Z.parquet"
-  s3_endpoint_url: "http://192.168.1.50:9000"
-  s3_bucket_name: "iotsim"
-  s3_access_key: "access"
-  s3_secret_key: "secret"
-
-window: { sample_count: 1346 }
+window: { sample_count: 128 }
 preprocessing:
   interpolation: { enabled: true, max_gap_fraction: 0.20 }
-  scaling: { enabled: true, method: "standard", output_min: 0.0, output_max: 1.0, epsilon: 0.000000000001 }
+  scaling: { enabled: false, method: "standard", output_min: 0.0, output_max: 1.0, epsilon: 0.000000000001 }
   decomposition:
-    trend: { enabled: true, alpha: 0.2, beta: 0.1 }
+    trend: { enabled: false, alpha: 0.2, beta: 0.1 }
     seasonal:
-      enabled: true
-      window_size_samples: 240
+      enabled: false
+      window_size_samples: 48
       detection_interval_samples: 1
-      min_period_samples: 120
-      max_period_samples: 240
-  smoothing: { enabled: true, method: "moving_average", window_size: 7 }
+      min_period_samples: 2
+      max_period_samples: 24
+  smoothing: { enabled: false, method: "moving_average", window_size: 5 }
 
 streams:
   water_line_pressure:
     headers: { entity_id: "municipal_water_system_01", sensor_id: "water-line-pressure-01", sensor_type: "scenario_signal", metric: "line_pressure_psi" }
-  # rack_cpu_utilization:
-  #   headers: { entity_id: "data_center_rack_01", sensor_id: "rack-telemetry-01", sensor_type: "data_center_rack", metric: "cpu_utilization" }
   # rack_temperature:
-  #   headers: { entity_id: "data_center_rack_01", sensor_id: "rack-telemetry-01", sensor_type: "data_center_rack", metric: "temperature_f" }
+  #   interval_ms: 60000
+  #   headers: { entity_id: "data_center_rack_01", sensor_id: "rack-temperature-01", sensor_type: "scenario_signal", metric: "temperature_c" }
   # rack_humidity:
-  #   headers: { entity_id: "data_center_rack_01", sensor_id: "rack-telemetry-01", sensor_type: "data_center_rack", metric: "relative_humidity_pct" }
+  #   interval_ms: 60000
+  #   headers: { entity_id: "data_center_rack_01", sensor_id: "rack-humidity-01", sensor_type: "scenario_signal", metric: "humidity_pct" }
   # rack_day_of_week:
-  #   headers: { entity_id: "data_center_rack_01", sensor_id: "rack-telemetry-01", sensor_type: "data_center_rack", metric: "day_of_week" }
+  #   interval_ms: 60000
+  #   headers: { entity_id: "data_center_rack_01", sensor_id: "rack-day-context-01", sensor_type: "scenario_signal", metric: "day_of_week" }
   # cleanroom_moisture:
-  #   interval_ms: 100
+  #   interval_ms: 5000
   #   headers: { entity_id: "battery_cleanroom_airlock_01", sensor_id: "cleanroom-dew-point-01", sensor_type: "scenario_signal", metric: "moisture_ppm" }
   # cleanroom_cart_passage:
-  #   interval_ms: 100
+  #   interval_ms: 5000
   #   headers: { entity_id: "battery_cleanroom_airlock_01", sensor_id: "cleanroom-cart-passage-01", sensor_type: "scenario_signal", metric: "cart_passage" }
   # fccu_feed_pressure:
-  #   interval_ms: 25
+  #   interval_ms: 250
   #   headers: { entity_id: "refinery_fccu_01", sensor_id: "fccu-feed-pressure-01", sensor_type: "scenario_signal", metric: "discharge_pressure_psi" }
   # fccu_coolant_flow:
-  #   interval_ms: 250
+  #   interval_ms: 60000
   #   headers: { entity_id: "refinery_fccu_01", sensor_id: "fccu-coolant-flow-01", sensor_type: "scenario_signal", metric: "coolant_flow_lpm" }
   # fccu_ambient_temperature:
-  #   interval_ms: 250
+  #   interval_ms: 60000
   #   headers: { entity_id: "refinery_fccu_01", sensor_id: "fccu-ambient-temperature-01", sensor_type: "scenario_signal", metric: "ambient_temperature_c" }
   # fccu_surface_temperature_01:
-  #   interval_ms: 250
+  #   interval_ms: 3600000
   #   headers: { entity_id: "refinery_fccu_01", sensor_id: "fccu-surface-temperature-01", sensor_type: "scenario_signal", metric: "surface_temperature_c" }
   # fccu_surface_temperature_02:
-  #   interval_ms: 250
+  #   interval_ms: 3600000
   #   headers: { entity_id: "refinery_fccu_01", sensor_id: "fccu-surface-temperature-02", sensor_type: "scenario_signal", metric: "surface_temperature_c" }
   # stripper_differential_pressure:
-  #   interval_ms: 25
+  #   interval_ms: 250
   #   headers: { entity_id: "batch_reactor_stripper_01", sensor_id: "stripper-dp-01", sensor_type: "scenario_signal", metric: "differential_pressure_psi" }
   # reactor_agitator_current:
-  #   interval_ms: 250
+  #   interval_ms: 60000
   #   headers: { entity_id: "batch_reactor_stripper_01", sensor_id: "reactor-agitator-power-01", sensor_type: "scenario_signal", metric: "motor_current_a" }
   # reactor_batch_step:
-  #   interval_ms: 250
+  #   interval_ms: 60000
   #   headers: { entity_id: "batch_reactor_stripper_01", sensor_id: "reactor-batch-step-01", sensor_type: "scenario_signal", metric: "batch_step" }
   # reactor_internal_temperature:
-  #   interval_ms: 250
+  #   interval_ms: 60000
   #   headers: { entity_id: "batch_reactor_stripper_01", sensor_id: "reactor-internal-temperature-01", sensor_type: "scenario_signal", metric: "reaction_temperature_c" }
   # reactor_jacket_inlet:
-  #   interval_ms: 250
+  #   interval_ms: 60000
   #   headers: { entity_id: "batch_reactor_stripper_01", sensor_id: "reactor-jacket-inlet-01", sensor_type: "scenario_signal", metric: "jacket_inlet_temperature_c" }
   # reactor_jacket_outlet:
-  #   interval_ms: 250
+  #   interval_ms: 60000
   #   headers: { entity_id: "batch_reactor_stripper_01", sensor_id: "reactor-jacket-outlet-01", sensor_type: "scenario_signal", metric: "jacket_outlet_temperature_c" }
 
 models:
@@ -98,42 +88,20 @@ models:
     kind: "univariate"
     algorithm: "mad"
     inputs: ["water_line_pressure"]
-    parameters: { mad_ema_alpha: 0.05, epsilon: 0.1 }
     thresholds: { score: 8.0 }
   # - id: "rack-weekend-context-mahalanobis"
   #   enabled: true
   #   kind: "multivariate"
   #   algorithm: "mahalanobis"
-  #   inputs: ["rack_cpu_utilization", "rack_temperature", "rack_humidity", "rack_day_of_week"]
-  #   parameters: { window_size: 1344, max_time_skew_ms: 1, regularization: 0.000001, shrinkage: 0.10, score_detector_enabled: true, score_detector: "z_score", score_window_size: 96 }
-  #   thresholds: { score: 4.0 }
-  # - id: "rack-weekend-context-linear-pca"
-  #   enabled: true
-  #   kind: "multivariate"
-  #   algorithm: "pca"
-  #   inputs: ["rack_cpu_utilization", "rack_temperature", "rack_humidity", "rack_day_of_week"]
-  #   parameters: { window_size: 16, max_time_skew_ms: 1, retained_components: 2, score_detector_enabled: false, score_detector: "z_score", score_window_size: 8 }
-  #   thresholds: { score: 4.0 }
-  # - id: "rack-weekend-context-kernel-pca"
-  #   enabled: true
-  #   kind: "multivariate"
-  #   algorithm: "kernel_pca"
-  #   inputs: ["rack_cpu_utilization", "rack_temperature", "rack_humidity", "rack_day_of_week"]
-  #   parameters: { window_size: 240, max_time_skew_ms: 1, retained_components: 4, rff_dimension: 16, gamma: "auto", seed: 20260831, score_detector_enabled: false, score_detector: "z_score", score_window_size: 120 }
-  #   thresholds: { score: 4.0 }
-  # - id: "rack-weekend-context-gsta"
-  #   enabled: true
-  #   kind: "multivariate"
-  #   algorithm: "gsta"
-  #   inputs: ["rack_cpu_utilization", "rack_temperature", "rack_humidity", "rack_day_of_week"]
-  #   parameters: { window_size: 240, max_time_skew_ms: 1, latent_channels: 16, attention_heads: 8, gate_threshold: 2.0, learning_rate: 0.001, warmup_steps: 16, seed: 20260828, score_detector_enabled: false, score_detector: "z_score", score_window_size: 120 }
+  #   inputs: ["rack_temperature", "rack_humidity", "rack_day_of_week"]
+  #   parameters: { window_size: 64, max_time_skew_ms: 60000, regularization: 0.000001, shrinkage: 0.10, score_detector: "mad", score_window_size: 32 }
   #   thresholds: { score: 4.0 }
   # - id: "cleanroom-frozen-sequence-gsta"
   #   enabled: true
   #   kind: "multivariate"
   #   algorithm: "gsta"
   #   inputs: ["cleanroom_moisture", "cleanroom_cart_passage"]
-  #   parameters: { window_size: 80, max_time_skew_ms: 100, latent_channels: 16, attention_heads: 8, gate_threshold: 2.0, learning_rate: 0.001, warmup_steps: 16, seed: 20260828, score_detector: "mad", score_window_size: 8 }
+  #   parameters: { window_size: 240, max_time_skew_ms: 5000, latent_channels: 16, attention_heads: 8, gate_threshold: 2.0, learning_rate: 0.001, warmup_steps: 64, seed: 20260828, score_detector: "mad", score_window_size: 32 }
   #   thresholds: { score: 4.0 }
   # - id: "fccu-feed-pressure-z-score"
   #   enabled: true
@@ -147,14 +115,14 @@ models:
   #   kind: "multivariate"
   #   algorithm: "mahalanobis"
   #   inputs: ["fccu_coolant_flow", "fccu_ambient_temperature"]
-  #   parameters: { window_size: 16, max_time_skew_ms: 250, regularization: 0.000001, shrinkage: 0.10, score_detector: "mad", score_window_size: 8 }
+  #   parameters: { window_size: 64, max_time_skew_ms: 60000, regularization: 0.000001, shrinkage: 0.10, score_detector: "mad", score_window_size: 32 }
   #   thresholds: { score: 4.0 }
   # - id: "fccu-wall-erosion-gsta"
   #   enabled: true
   #   kind: "multivariate"
   #   algorithm: "gsta"
   #   inputs: ["fccu_surface_temperature_01", "fccu_surface_temperature_02"]
-  #   parameters: { window_size: 24, max_time_skew_ms: 250, latent_channels: 8, attention_heads: 2, gate_threshold: 25.0, learning_rate: 0.001, warmup_steps: 16, seed: 20260829, score_detector: "mad", score_window_size: 8 }
+  #   parameters: { window_size: 6, max_time_skew_ms: 3600000, latent_channels: 8, attention_heads: 2, gate_threshold: 25.0, learning_rate: 0.001, warmup_steps: 64, seed: 20260829, score_detector: "mad", score_window_size: 12 }
   #   thresholds: { score: 4.0 }
   # - id: "stripper-dp-z-score"
   #   enabled: true
@@ -168,12 +136,12 @@ models:
   #   kind: "multivariate"
   #   algorithm: "mahalanobis"
   #   inputs: ["reactor_agitator_current", "reactor_batch_step"]
-  #   parameters: { window_size: 16, max_time_skew_ms: 250, regularization: 0.000001, shrinkage: 0.10, score_detector: "mad", score_window_size: 8 }
+  #   parameters: { window_size: 64, max_time_skew_ms: 60000, regularization: 0.000001, shrinkage: 0.10, score_detector: "mad", score_window_size: 32 }
   #   thresholds: { score: 4.0 }
   # - id: "reactor-jacket-fouling-gsta"
   #   enabled: true
   #   kind: "multivariate"
   #   algorithm: "gsta"
   #   inputs: ["reactor_internal_temperature", "reactor_jacket_inlet", "reactor_jacket_outlet"]
-  #   parameters: { window_size: 21, max_time_skew_ms: 250, latent_channels: 12, attention_heads: 3, gate_threshold: 100.0, learning_rate: 0.001, warmup_steps: 16, seed: 20260830, score_detector: "mad", score_window_size: 8 }
+  #   parameters: { window_size: 105, max_time_skew_ms: 60000, latent_channels: 16, attention_heads: 5, gate_threshold: 100.0, learning_rate: 0.001, warmup_steps: 64, seed: 20260830, score_detector: "mad", score_window_size: 32 }
   #   thresholds: { score: 4.0 }

@@ -5,12 +5,9 @@ pub mod smoothing;
 
 use std::collections::VecDeque;
 
-use crate::config::{
-    DecompositionMethod, PreprocessingConfig, ScalingMethod, SmoothingMethod, WindowConfig,
-};
+use crate::config::{PreprocessingConfig, ScalingMethod, SmoothingMethod, WindowConfig};
 use crate::window::Sample;
 
-use self::decomposition::{stl, twitter};
 use self::interpolation::{InterpolationResult, bounded_linear};
 use self::scaling::{min_max, standard};
 use self::smoothing::{exponential_moving_average, moving_average};
@@ -19,14 +16,14 @@ use self::smoothing::{exponential_moving_average, moving_average};
 #[derive(Debug, Clone)]
 pub struct Preprocessor {
     config: PreprocessingConfig,
-    window_duration_ms: i64,
+    window_sample_count: usize,
 }
 
 impl Preprocessor {
     pub fn new(config: &PreprocessingConfig, window: &WindowConfig) -> Self {
         Self {
             config: config.clone(),
-            window_duration_ms: window.duration_ms,
+            window_sample_count: window.sample_count,
         }
     }
 
@@ -40,47 +37,49 @@ impl Preprocessor {
             previous,
             current,
             interval_ms,
-            self.window_duration_ms,
+            self.window_sample_count,
             &self.config.interpolation,
         )
     }
 
-    /// Recomputes the derived window in the configured order. Recalculation is
-    /// intentional because scaling and decomposition statistics move whenever
-    /// a raw sample enters or leaves the sliding window.
-    pub fn transform(&self, raw: &VecDeque<Sample>, interval_ms: i64) -> Option<VecDeque<Sample>> {
-        let mut values: Vec<f64> = raw.iter().map(|sample| sample.value).collect();
+    /// Metric preprocessing shared by raw multivariate inputs: scaling followed
+    /// by the configured moving-average filter. Decomposition is deliberately
+    /// excluded from this path.
+    pub fn transform_multivariate(&self, raw: &VecDeque<Sample>) -> VecDeque<Sample> {
+        self.transform_values(raw, true, true)
+    }
 
-        if self.config.scaling.enabled {
-            values = match self.config.scaling.method {
-                ScalingMethod::MinMax => min_max(
-                    &values,
-                    self.config.scaling.output_min,
-                    self.config.scaling.output_max,
-                    self.config.scaling.epsilon,
-                ),
-                ScalingMethod::Standard => standard(&values, self.config.scaling.epsilon),
-            };
+    /// The current scaled observation which feeds the stateful univariate
+    /// trend/seasonal decomposition.
+    pub fn latest_scaled_value(&self, raw: &VecDeque<Sample>) -> Option<f64> {
+        self.scale(raw.iter().map(|sample| sample.value).collect())
+            .pop()
+    }
+
+    /// Applies only smoothing to an already decomposed univariate series.
+    pub fn smooth_decomposed(&self, values: &VecDeque<Sample>) -> VecDeque<Sample> {
+        self.transform_values(values, false, true)
+    }
+
+    /// Preserves window-local scaling when univariate decomposition is off.
+    pub fn transform_univariate_without_decomposition(
+        &self,
+        raw: &VecDeque<Sample>,
+    ) -> VecDeque<Sample> {
+        self.transform_values(raw, true, true)
+    }
+
+    fn transform_values(
+        &self,
+        samples: &VecDeque<Sample>,
+        apply_scaling: bool,
+        apply_smoothing: bool,
+    ) -> VecDeque<Sample> {
+        let mut values: Vec<f64> = samples.iter().map(|sample| sample.value).collect();
+        if apply_scaling {
+            values = self.scale(values);
         }
-
-        if self.config.decomposition.enabled {
-            let period_samples = self
-                .config
-                .decomposition
-                .period_ms
-                .saturating_add(interval_ms / 2)
-                / interval_ms;
-            let period_samples = usize::try_from(period_samples).ok()?;
-            let components = match self.config.decomposition.method {
-                DecompositionMethod::Stl => {
-                    stl(&values, period_samples, &self.config.decomposition.stl)
-                }
-                DecompositionMethod::Twitter => twitter(&values, period_samples),
-            }?;
-            values = components.remainder;
-        }
-
-        if self.config.smoothing.enabled {
+        if apply_smoothing && self.config.smoothing.enabled {
             values = match self.config.smoothing.method {
                 SmoothingMethod::MovingAverage => {
                     moving_average(&values, self.config.smoothing.window_size)
@@ -90,16 +89,29 @@ impl Preprocessor {
                 }
             };
         }
+        samples
+            .iter()
+            .zip(values)
+            .map(|(sample, value)| Sample {
+                timestamp_ms: sample.timestamp_ms,
+                value,
+            })
+            .collect()
+    }
 
-        Some(
-            raw.iter()
-                .zip(values)
-                .map(|(sample, value)| Sample {
-                    timestamp_ms: sample.timestamp_ms,
-                    value,
-                })
-                .collect(),
-        )
+    fn scale(&self, values: Vec<f64>) -> Vec<f64> {
+        if !self.config.scaling.enabled {
+            return values;
+        }
+        match self.config.scaling.method {
+            ScalingMethod::MinMax => min_max(
+                &values,
+                self.config.scaling.output_min,
+                self.config.scaling.output_max,
+                self.config.scaling.epsilon,
+            ),
+            ScalingMethod::Standard => standard(&values, self.config.scaling.epsilon),
+        }
     }
 }
 
@@ -126,14 +138,7 @@ mod tests {
                 window_size: 2,
             },
         };
-        let processor = Preprocessor::new(
-            &config,
-            &WindowConfig {
-                duration_ms: 10,
-                minimum_samples: 2,
-                max_lateness_ms: 0,
-            },
-        );
+        let processor = Preprocessor::new(&config, &WindowConfig { sample_count: 3 });
         let raw = VecDeque::from([
             Sample {
                 timestamp_ms: 0,
@@ -149,8 +154,7 @@ mod tests {
             },
         ]);
         let values: Vec<f64> = processor
-            .transform(&raw, 1)
-            .unwrap()
+            .transform_multivariate(&raw)
             .iter()
             .map(|sample| sample.value)
             .collect();

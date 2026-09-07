@@ -69,7 +69,7 @@ use burn::optim::adaptor::OptimizerAdaptor;
 use burn::optim::{Adam, AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::{leaky_relu, relu, softmax};
 use burn::tensor::backend::Backend;
-use burn::tensor::{Distribution, ElementConversion, Tensor, TensorData};
+use burn::tensor::{Device, Distribution, ElementConversion, Tensor, TensorData};
 
 use crate::model::{ModelError, ModelInput};
 
@@ -77,7 +77,7 @@ type InferenceBackend = Wgpu<f32, i32>;
 type TrainingBackend = Autodiff<InferenceBackend>;
 type GstaModel = GatedAutoencoder<TrainingBackend>;
 type GstaOptimizer = OptimizerAdaptor<Adam, GstaModel, TrainingBackend>;
-type GstaDevice = <TrainingBackend as Backend>::Device;
+type GstaDevice = Device<TrainingBackend>;
 
 /// Builds a channel-major temporal matrix only when every channel contains a
 /// complete, positionally aligned window. Configuration requires equal source
@@ -328,8 +328,8 @@ impl GstaDetector {
         warmup_steps: usize,
         seed: u64,
     ) -> Self {
-        TrainingBackend::seed(seed);
         let device = GstaDevice::default();
+        TrainingBackend::seed(&device, seed);
         let model = GatedAutoencoder::new(
             channels,
             window_size,

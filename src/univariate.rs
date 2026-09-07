@@ -4,7 +4,7 @@ pub mod z_score;
 use crate::config::{ModelConfig, ModelKind};
 use crate::model::{AnomalyModel, Detection, ModelError, ModelInput};
 
-use self::mad::Mad;
+use self::mad::{DEFAULT_MAD_EMA_ALPHA, DEFAULT_MAD_EPSILON, Mad};
 use self::z_score::ZScore;
 
 /// All currently supported univariate detectors.
@@ -60,15 +60,41 @@ impl UnivariateModel {
                     ddof,
                 )?))
             }
-            "mad" => Ok(Self::Mad(Mad::new(
-                config.id.clone(),
-                input.clone(),
-                threshold,
-            )?)),
+            "mad" => {
+                let float_parameter = |name: &str, default: f64| {
+                    config
+                        .parameters
+                        .get(name)
+                        .map(|value| {
+                            value.as_f64().ok_or_else(|| {
+                                ModelError::new(format!(
+                                    "model '{}' parameters.{name} must be numeric",
+                                    config.id
+                                ))
+                            })
+                        })
+                        .transpose()
+                        .map(|value| value.unwrap_or(default))
+                };
+                Ok(Self::Mad(Mad::with_stability(
+                    config.id.clone(),
+                    input.clone(),
+                    threshold,
+                    float_parameter("mad_ema_alpha", DEFAULT_MAD_EMA_ALPHA)?,
+                    float_parameter("epsilon", DEFAULT_MAD_EPSILON)?,
+                )?))
+            }
             algorithm => Err(ModelError::new(format!(
                 "unsupported univariate algorithm '{algorithm}' for model '{}'",
                 config.id
             ))),
+        }
+    }
+
+    pub fn reset(&self) -> Result<(), ModelError> {
+        match self {
+            Self::ZScore(_) => Ok(()),
+            Self::Mad(model) => model.reset(),
         }
     }
 }

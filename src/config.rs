@@ -8,7 +8,12 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub mode: RunMode,
+    #[serde(default)]
     pub kafka: KafkaConfig,
+    #[serde(default)]
+    pub dataset: DatasetConfig,
     pub window: WindowConfig,
     #[serde(default)]
     pub preprocessing: PreprocessingConfig,
@@ -32,27 +37,13 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.kafka.brokers.trim().is_empty()
-            || self.kafka.topic.trim().is_empty()
-            || self.kafka.output_topic.trim().is_empty()
-        {
-            return Err(ConfigurationError::Validation(
-                "kafka.brokers, kafka.topic, and kafka.output_topic cannot be empty".into(),
-            ));
+        match self.mode {
+            RunMode::Streaming => self.kafka.validate()?,
+            RunMode::Dataset => self.dataset.validate()?,
         }
-        if self.kafka.group_id.trim().is_empty() || self.kafka.client_id.trim().is_empty() {
+        if self.window.sample_count == 0 {
             return Err(ConfigurationError::Validation(
-                "kafka.group_id and kafka.client_id cannot be empty".into(),
-            ));
-        }
-        if self.window.duration_ms <= 0 || self.window.minimum_samples == 0 {
-            return Err(ConfigurationError::Validation(
-                "window.duration_ms and window.minimum_samples must be greater than zero".into(),
-            ));
-        }
-        if self.window.max_lateness_ms < 0 {
-            return Err(ConfigurationError::Validation(
-                "window.max_lateness_ms cannot be negative".into(),
+                "window.sample_count must be greater than zero".into(),
             ));
         }
         self.preprocessing.validate(&self.window)?;
@@ -66,18 +57,6 @@ impl AppConfig {
                 return Err(ConfigurationError::Validation(
                     "stream names and header filters cannot be empty".into(),
                 ));
-            }
-            if stream.interval_ms <= 0 || stream.interval_ms > self.window.duration_ms {
-                return Err(ConfigurationError::Validation(format!(
-                    "stream '{name}' interval_ms must be positive and no longer than window.duration_ms"
-                )));
-            }
-            if self.preprocessing.decomposition.enabled
-                && self.preprocessing.decomposition.period_ms / stream.interval_ms < 2
-            {
-                return Err(ConfigurationError::Validation(format!(
-                    "decomposition.period_ms must contain at least two samples for stream '{name}'"
-                )));
             }
             for required in ["entity_id", "sensor_id", "metric"] {
                 if !stream.headers.contains_key(required) {
@@ -113,9 +92,7 @@ impl AppConfig {
             }
             match model.kind {
                 ModelKind::Univariate => validate_univariate_model(model, &self.window)?,
-                ModelKind::Multivariate => {
-                    validate_multivariate_model(model, &self.streams, &self.window)?
-                }
+                ModelKind::Multivariate => validate_multivariate_model(model, &self.window)?,
             }
             let expected = match model.kind {
                 ModelKind::Univariate => 1,
@@ -157,6 +134,16 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+/// Only one input mode can be active for a run. Dataset mode intentionally
+/// performs no Kafka consume or produce operations.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    #[default]
+    Streaming,
+    Dataset,
 }
 
 fn validate_score_threshold(model: &ModelConfig) -> Result<(), ConfigurationError> {
@@ -235,9 +222,24 @@ fn validate_univariate_model(
     validate_score_threshold(model)?;
     if model.algorithm == "z_score" {
         let ddof = usize_parameter(model, "ddof", Some(0))?;
-        if ddof >= window.minimum_samples {
+        if ddof >= window.sample_count {
             return Err(ConfigurationError::Validation(format!(
-                "Z-score model '{}' parameters.ddof must be less than window.minimum_samples",
+                "Z-score model '{}' parameters.ddof must be less than window.sample_count",
+                model.id
+            )));
+        }
+    } else {
+        let mad_ema_alpha = f64_parameter(model, "mad_ema_alpha", Some(0.05))?;
+        if !(0.0 < mad_ema_alpha && mad_ema_alpha <= 1.0) {
+            return Err(ConfigurationError::Validation(format!(
+                "MAD model '{}' parameters.mad_ema_alpha must be in (0, 1]",
+                model.id
+            )));
+        }
+        let epsilon = f64_parameter(model, "epsilon", Some(1e-6))?;
+        if epsilon <= 0.0 {
+            return Err(ConfigurationError::Validation(format!(
+                "MAD model '{}' parameters.epsilon must be positive",
                 model.id
             )));
         }
@@ -247,7 +249,6 @@ fn validate_univariate_model(
 
 fn validate_multivariate_model(
     model: &ModelConfig,
-    streams: &BTreeMap<String, StreamConfig>,
     window: &WindowConfig,
 ) -> Result<(), ConfigurationError> {
     if !matches!(
@@ -261,6 +262,8 @@ fn validate_multivariate_model(
     }
     validate_score_threshold(model)?;
 
+    // A day-of-week input is represented by its sine and cosine coordinates
+    // inside multivariate engines, replacing the ordinal source coordinate.
     let dimensions = model.inputs.len();
     let window_size = usize_parameter(model, "window_size", None)?;
     if window_size < 2 {
@@ -277,36 +280,48 @@ fn validate_multivariate_model(
         ))
     })?;
 
-    let score_detector = model
-        .parameters
-        .get("score_detector")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            ConfigurationError::Validation(format!(
-                "multivariate model '{}' requires string parameters.score_detector",
+    let score_detector_enabled = match model.parameters.get("score_detector_enabled") {
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(ConfigurationError::Validation(format!(
+                "multivariate model '{}' parameters.score_detector_enabled must be boolean",
                 model.id
-            ))
-        })?;
-    if !matches!(score_detector, "z_score" | "mad") {
-        return Err(ConfigurationError::Validation(format!(
-            "multivariate model '{}' parameters.score_detector must be 'z_score' or 'mad'",
-            model.id
-        )));
-    }
-    let score_window_size = usize_parameter(model, "score_window_size", None)?;
-    if score_window_size < 2 {
-        return Err(ConfigurationError::Validation(format!(
-            "multivariate model '{}' parameters.score_window_size must be at least 2",
-            model.id
-        )));
-    }
-    if score_detector == "z_score"
-        && usize_parameter(model, "score_ddof", Some(0))? >= score_window_size
-    {
-        return Err(ConfigurationError::Validation(format!(
-            "multivariate model '{}' parameters.score_ddof must be less than parameters.score_window_size",
-            model.id
-        )));
+            )));
+        }
+        None => true,
+    };
+    if score_detector_enabled {
+        let score_detector = model
+            .parameters
+            .get("score_detector")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ConfigurationError::Validation(format!(
+                    "multivariate model '{}' requires string parameters.score_detector when parameters.score_detector_enabled is true",
+                    model.id
+                ))
+            })?;
+        if !matches!(score_detector, "z_score" | "mad") {
+            return Err(ConfigurationError::Validation(format!(
+                "multivariate model '{}' parameters.score_detector must be 'z_score' or 'mad'",
+                model.id
+            )));
+        }
+        let score_window_size = usize_parameter(model, "score_window_size", None)?;
+        if score_window_size < 2 {
+            return Err(ConfigurationError::Validation(format!(
+                "multivariate model '{}' parameters.score_window_size must be at least 2",
+                model.id
+            )));
+        }
+        if score_detector == "z_score"
+            && usize_parameter(model, "score_ddof", Some(0))? >= score_window_size
+        {
+            return Err(ConfigurationError::Validation(format!(
+                "multivariate model '{}' parameters.score_ddof must be less than parameters.score_window_size",
+                model.id
+            )));
+        }
     }
 
     match model.algorithm.as_str() {
@@ -405,50 +420,9 @@ fn validate_multivariate_model(
             }
             let _ = usize_parameter(model, "seed", Some(0))?;
 
-            let first_input = model.inputs.first().ok_or_else(|| {
-                ConfigurationError::Validation(format!(
-                    "GSTA model '{}' requires input streams",
-                    model.id
-                ))
-            })?;
-            let interval_ms = streams
-                .get(first_input)
-                .ok_or_else(|| {
-                    ConfigurationError::Validation(format!(
-                        "model '{}' references unknown stream '{first_input}'",
-                        model.id
-                    ))
-                })?
-                .interval_ms;
-            for input in &model.inputs[1..] {
-                let input_interval = streams
-                    .get(input)
-                    .ok_or_else(|| {
-                        ConfigurationError::Validation(format!(
-                            "model '{}' references unknown stream '{input}'",
-                            model.id
-                        ))
-                    })?
-                    .interval_ms;
-                if input_interval != interval_ms {
-                    return Err(ConfigurationError::Validation(format!(
-                        "GSTA model '{}' requires every input stream to have the same interval_ms",
-                        model.id
-                    )));
-                }
-            }
-            let required_span = i64::try_from(window_size.saturating_sub(1))
-                .ok()
-                .and_then(|steps| steps.checked_mul(interval_ms))
-                .ok_or_else(|| {
-                    ConfigurationError::Validation(format!(
-                        "GSTA model '{}' parameters.window_size is too large",
-                        model.id
-                    ))
-                })?;
-            if required_span > window.duration_ms {
+            if window_size > window.sample_count {
                 return Err(ConfigurationError::Validation(format!(
-                    "GSTA model '{}' parameters.window_size does not fit within window.duration_ms at the configured input cadence",
+                    "GSTA model '{}' parameters.window_size cannot exceed window.sample_count",
                     model.id
                 )));
             }
@@ -468,18 +442,121 @@ pub enum ConfigurationError {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct KafkaConfig {
+    #[serde(default)]
     pub brokers: String,
+    #[serde(default)]
     pub topic: String,
     #[serde(default = "default_output_topic")]
     pub output_topic: String,
+    #[serde(default)]
     pub group_id: String,
+    #[serde(default)]
     pub client_id: String,
     #[serde(default = "default_offset_reset")]
     pub auto_offset_reset: String,
     #[serde(default)]
     pub invalid_message_policy: InvalidMessagePolicy,
     #[serde(default)]
+    pub logging: KafkaLoggingConfig,
+    #[serde(default)]
     pub security: KafkaSecurityConfig,
+}
+
+impl Default for KafkaConfig {
+    fn default() -> Self {
+        Self {
+            brokers: String::new(),
+            topic: String::new(),
+            output_topic: default_output_topic(),
+            group_id: String::new(),
+            client_id: String::new(),
+            auto_offset_reset: default_offset_reset(),
+            invalid_message_policy: InvalidMessagePolicy::default(),
+            logging: KafkaLoggingConfig::default(),
+            security: KafkaSecurityConfig::default(),
+        }
+    }
+}
+
+impl KafkaConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
+        if self.brokers.trim().is_empty()
+            || self.topic.trim().is_empty()
+            || self.output_topic.trim().is_empty()
+        {
+            return Err(ConfigurationError::Validation("kafka.brokers, kafka.topic, and kafka.output_topic cannot be empty in streaming mode".into()));
+        }
+        if self.group_id.trim().is_empty() || self.client_id.trim().is_empty() {
+            return Err(ConfigurationError::Validation(
+                "kafka.group_id and kafka.client_id cannot be empty in streaming mode".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DatasetConfig {
+    /// Object key produced by iot-sim, for example dataset/iot-telemetry-....parquet.
+    #[serde(default)]
+    pub parquet_key: String,
+    #[serde(default = "default_s3_endpoint_url")]
+    pub s3_endpoint_url: String,
+    #[serde(default = "default_s3_bucket_name")]
+    pub s3_bucket_name: String,
+    #[serde(default = "default_s3_access_key")]
+    pub s3_access_key: String,
+    #[serde(default = "default_s3_secret_key")]
+    pub s3_secret_key: String,
+}
+
+impl Default for DatasetConfig {
+    fn default() -> Self {
+        Self {
+            parquet_key: String::new(),
+            s3_endpoint_url: default_s3_endpoint_url(),
+            s3_bucket_name: default_s3_bucket_name(),
+            s3_access_key: default_s3_access_key(),
+            s3_secret_key: default_s3_secret_key(),
+        }
+    }
+}
+
+impl DatasetConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
+        for (name, value) in [
+            ("parquet_key", &self.parquet_key),
+            ("s3_endpoint_url", &self.s3_endpoint_url),
+            ("s3_bucket_name", &self.s3_bucket_name),
+            ("s3_access_key", &self.s3_access_key),
+            ("s3_secret_key", &self.s3_secret_key),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ConfigurationError::Validation(format!(
+                    "dataset.{name} cannot be empty in dataset mode"
+                )));
+            }
+        }
+        if !self.parquet_key.ends_with(".parquet") {
+            return Err(ConfigurationError::Validation(
+                "dataset.parquet_key must name a .parquet object".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_s3_endpoint_url() -> String {
+    "http://192.168.1.50:9000".into()
+}
+fn default_s3_bucket_name() -> String {
+    "iotsim".into()
+}
+fn default_s3_access_key() -> String {
+    "access".into()
+}
+fn default_s3_secret_key() -> String {
+    "secret".into()
 }
 
 fn default_output_topic() -> String {
@@ -498,6 +575,19 @@ pub enum InvalidMessagePolicy {
     Fail,
 }
 
+/// Controls structured application logs for records that pass the configured
+/// Kafka header allow-list and for anomaly results sent to Kafka.
+///
+/// Both options default to false so a configuration upgrade does not
+/// unexpectedly expose telemetry values or increase log volume.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct KafkaLoggingConfig {
+    #[serde(default)]
+    pub log_consumed_messages: bool,
+    #[serde(default)]
+    pub log_produced_results: bool,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct KafkaSecurityConfig {
     pub security_protocol: Option<String>,
@@ -508,27 +598,13 @@ pub struct KafkaSecurityConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WindowConfig {
-    pub duration_ms: i64,
-    #[serde(default = "default_minimum_samples")]
-    pub minimum_samples: usize,
-    #[serde(default = "default_max_lateness_ms")]
-    pub max_lateness_ms: i64,
-}
-
-fn default_minimum_samples() -> usize {
-    2
-}
-
-fn default_max_lateness_ms() -> i64 {
-    5_000
+    pub sample_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamConfig {
     /// Exact Kafka-header matches. Payloads are decoded only after this filter matches.
     pub headers: BTreeMap<String, String>,
-    /// Expected source cadence, used to detect and interpolate missing samples.
-    pub interval_ms: i64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -544,7 +620,7 @@ pub struct PreprocessingConfig {
 }
 
 impl PreprocessingConfig {
-    fn validate(&self, window: &WindowConfig) -> Result<(), ConfigurationError> {
+    fn validate(&self, _window: &WindowConfig) -> Result<(), ConfigurationError> {
         if !(0.0..=0.20).contains(&self.interpolation.max_gap_fraction)
             || self.interpolation.max_gap_fraction == 0.0
         {
@@ -570,23 +646,40 @@ impl PreprocessingConfig {
                 "preprocessing.smoothing.window_size must be greater than zero".into(),
             ));
         }
-        if self.decomposition.period_ms <= 0 {
-            return Err(ConfigurationError::Validation(
-                "preprocessing.decomposition.period_ms must be positive".into(),
-            ));
-        }
-        if self.decomposition.enabled
-            && window.duration_ms < self.decomposition.period_ms.saturating_mul(2)
+        if !self.decomposition.trend.alpha.is_finite()
+            || !(0.0..=1.0).contains(&self.decomposition.trend.alpha)
+            || self.decomposition.trend.alpha == 0.0
         {
             return Err(ConfigurationError::Validation(
-                "window.duration_ms must cover at least two decomposition periods".into(),
+                "preprocessing.decomposition.trend.alpha must be finite, greater than zero, and no greater than one".into(),
             ));
         }
-        if self.decomposition.stl.loess_span < 3
-            || self.decomposition.stl.loess_span.is_multiple_of(2)
+        if !self.decomposition.trend.beta.is_finite()
+            || !(0.0..=1.0).contains(&self.decomposition.trend.beta)
+            || self.decomposition.trend.beta == 0.0
         {
             return Err(ConfigurationError::Validation(
-                "preprocessing.decomposition.stl.loess_span must be odd and at least 3".into(),
+                "preprocessing.decomposition.trend.beta must be finite, greater than zero, and no greater than one".into(),
+            ));
+        }
+        let seasonal = &self.decomposition.seasonal;
+        if seasonal.window_size_samples < 4 {
+            return Err(ConfigurationError::Validation(
+                "preprocessing.decomposition.seasonal.window_size_samples must be at least 4"
+                    .into(),
+            ));
+        }
+        if seasonal.detection_interval_samples == 0 {
+            return Err(ConfigurationError::Validation(
+                "preprocessing.decomposition.seasonal.detection_interval_samples must be greater than zero".into(),
+            ));
+        }
+        if seasonal.min_period_samples < 2
+            || seasonal.max_period_samples < seasonal.min_period_samples
+            || seasonal.max_period_samples > seasonal.window_size_samples
+        {
+            return Err(ConfigurationError::Validation(
+                "preprocessing.decomposition.seasonal periods must satisfy 2 <= min_period_samples <= max_period_samples <= window_size_samples".into(),
             ));
         }
         Ok(())
@@ -688,64 +781,91 @@ pub enum SmoothingMethod {
     ExponentialMovingAverage,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecompositionConfig {
     #[serde(default)]
-    pub enabled: bool,
+    pub trend: TrendDecompositionConfig,
     #[serde(default)]
-    pub method: DecompositionMethod,
-    #[serde(default = "default_period_ms")]
-    pub period_ms: i64,
-    #[serde(default)]
-    pub stl: StlConfig,
+    pub seasonal: SeasonalDecompositionConfig,
 }
 
-impl Default for DecompositionConfig {
+impl DecompositionConfig {
+    pub fn enabled(&self) -> bool {
+        self.trend.enabled || self.seasonal.enabled
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrendDecompositionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_holt_alpha")]
+    pub alpha: f64,
+    #[serde(default = "default_holt_beta")]
+    pub beta: f64,
+}
+
+impl Default for TrendDecompositionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            method: DecompositionMethod::default(),
-            period_ms: default_period_ms(),
-            stl: StlConfig::default(),
+            alpha: default_holt_alpha(),
+            beta: default_holt_beta(),
         }
     }
 }
 
-fn default_period_ms() -> i64 {
-    86_400_000
+fn default_holt_alpha() -> f64 {
+    0.2
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DecompositionMethod {
-    #[default]
-    Stl,
-    Twitter,
+fn default_holt_beta() -> f64 {
+    0.1
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct StlConfig {
-    #[serde(default = "default_loess_span")]
-    pub loess_span: usize,
-    #[serde(default = "default_robust_iterations")]
-    pub robust_iterations: usize,
+#[serde(deny_unknown_fields)]
+pub struct SeasonalDecompositionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_seasonal_window_size")]
+    pub window_size_samples: usize,
+    #[serde(default = "default_detection_interval")]
+    pub detection_interval_samples: usize,
+    #[serde(default = "default_min_period")]
+    pub min_period_samples: usize,
+    #[serde(default = "default_max_period")]
+    pub max_period_samples: usize,
 }
 
-impl Default for StlConfig {
+impl Default for SeasonalDecompositionConfig {
     fn default() -> Self {
         Self {
-            loess_span: default_loess_span(),
-            robust_iterations: default_robust_iterations(),
+            enabled: false,
+            window_size_samples: default_seasonal_window_size(),
+            detection_interval_samples: default_detection_interval(),
+            min_period_samples: default_min_period(),
+            max_period_samples: default_max_period(),
         }
     }
 }
 
-fn default_loess_span() -> usize {
-    7
+fn default_seasonal_window_size() -> usize {
+    256
 }
 
-fn default_robust_iterations() -> usize {
+fn default_detection_interval() -> usize {
+    1
+}
+
+fn default_min_period() -> usize {
     2
+}
+
+fn default_max_period() -> usize {
+    256
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -779,6 +899,7 @@ mod tests {
 
     fn valid_config() -> AppConfig {
         AppConfig {
+            mode: RunMode::Streaming,
             kafka: KafkaConfig {
                 brokers: "localhost:9092".into(),
                 topic: "telemetry".into(),
@@ -787,18 +908,15 @@ mod tests {
                 client_id: "detector-1".into(),
                 auto_offset_reset: "latest".into(),
                 invalid_message_policy: InvalidMessagePolicy::Skip,
+                logging: KafkaLoggingConfig::default(),
                 security: KafkaSecurityConfig::default(),
             },
-            window: WindowConfig {
-                duration_ms: 60_000,
-                minimum_samples: 2,
-                max_lateness_ms: 5_000,
-            },
+            dataset: DatasetConfig::default(),
+            window: WindowConfig { sample_count: 12 },
             preprocessing: PreprocessingConfig::default(),
             streams: BTreeMap::from([(
                 "temperature".into(),
                 StreamConfig {
-                    interval_ms: 5_000,
                     headers: BTreeMap::from([
                         ("entity_id".into(), "station-1".into()),
                         ("sensor_id".into(), "weather-1".into()),
@@ -827,6 +945,18 @@ mod tests {
     }
 
     #[test]
+    fn dataset_mode_requires_a_parquet_object_key() {
+        let mut config = valid_config();
+        config.mode = RunMode::Dataset;
+        let error = config.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("dataset.parquet_key cannot be empty")
+        );
+    }
+
+    #[test]
     fn allows_multiple_univariate_models_for_the_same_stream() {
         let mut config = valid_config();
         config.models.push(ModelConfig {
@@ -839,6 +969,38 @@ mod tests {
             thresholds: BTreeMap::from([("score".into(), Value::from(3.5))]),
         });
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_mad_stability_parameters() {
+        let mut config = valid_config();
+        config.models[0].algorithm = "mad".into();
+        config.models[0].parameters = BTreeMap::from([
+            ("mad_ema_alpha".into(), Value::from(0.05)),
+            ("epsilon".into(), Value::from(0.1)),
+        ]);
+        assert!(config.validate().is_ok());
+
+        config.models[0]
+            .parameters
+            .insert("mad_ema_alpha".into(), Value::from(0.0));
+        assert!(config.validate().is_err());
+
+        config.models[0]
+            .parameters
+            .insert("mad_ema_alpha".into(), Value::from(0.05));
+        config.models[0]
+            .parameters
+            .insert("epsilon".into(), Value::from(0.0));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_window_sample_count() {
+        let mut config = valid_config();
+        config.window.sample_count = 0;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("window.sample_count must be greater than zero"));
     }
 
     #[test]
@@ -860,7 +1022,6 @@ mod tests {
         config.streams.insert(
             "humidity".into(),
             StreamConfig {
-                interval_ms: 5_000,
                 headers: BTreeMap::from([
                     ("entity_id".into(), "station-1".into()),
                     ("sensor_id".into(), "weather-1".into()),
@@ -913,30 +1074,16 @@ mod tests {
                 .iter()
                 .any(|model| model.algorithm == "z_score")
         );
-        assert!(config.models.iter().any(|model| model.algorithm == "mad"));
-        assert!(
-            config
-                .models
-                .iter()
-                .any(|model| model.algorithm == "mahalanobis")
-        );
-        assert!(config.models.iter().any(|model| model.algorithm == "pca"));
-        assert!(
-            config
-                .models
-                .iter()
-                .any(|model| model.algorithm == "kernel_pca")
-        );
-        assert!(config.models.iter().any(|model| model.algorithm == "gsta"));
+        assert!(config.kafka.logging.log_consumed_messages);
+        assert!(config.kafka.logging.log_produced_results);
     }
 
     #[test]
-    fn validates_gsta_temporal_shape_and_equal_input_cadence() {
+    fn validates_gsta_shape_against_the_sample_window() {
         let mut config = valid_config();
         config.streams.insert(
             "humidity".into(),
             StreamConfig {
-                interval_ms: 5_000,
                 headers: BTreeMap::from([
                     ("entity_id".into(), "station-1".into()),
                     ("sensor_id".into(), "weather-1".into()),
@@ -965,10 +1112,6 @@ mod tests {
         }];
         assert!(config.validate().is_ok());
 
-        config.streams.get_mut("humidity").unwrap().interval_ms = 4_000;
-        assert!(config.validate().is_err());
-
-        config.streams.get_mut("humidity").unwrap().interval_ms = 5_000;
         config.models[0]
             .parameters
             .insert("attention_heads".into(), Value::from(5));

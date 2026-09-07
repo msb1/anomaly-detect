@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dataset;
 pub mod kafka;
 pub mod model;
 pub mod multivariate;

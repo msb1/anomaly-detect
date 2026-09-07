@@ -39,13 +39,21 @@ pub struct AnomalyMessage {
 }
 
 impl AnomalyMessage {
-    fn from_detection(detection: Detection, model: &ModelConfig) -> Self {
-        let score_algorithm = model
-            .parameters
-            .get("score_detector")
-            .and_then(Value::as_str)
-            .unwrap_or(&model.algorithm)
-            .into();
+    pub fn from_detection(detection: Detection, model: &ModelConfig) -> Self {
+        let score_algorithm = if model.kind == ModelKind::Multivariate
+            && matches!(
+                model.parameters.get("score_detector_enabled"),
+                Some(Value::Bool(false))
+            ) {
+            "raw".into()
+        } else {
+            model
+                .parameters
+                .get("score_detector")
+                .and_then(Value::as_str)
+                .unwrap_or(&model.algorithm)
+                .into()
+        };
         Self {
             schema_version: ANOMALY_SCHEMA_VERSION.into(),
             timestamp_ms: detection.timestamp_ms,
@@ -83,7 +91,7 @@ pub async fn consume(
                 let Some(item) = item else { break };
                 match item {
                     Ok(message) => {
-                        match process_message(&pipeline, &message).await {
+                        match process_message(&pipeline, &message, config.logging.log_consumed_messages).await {
                             Ok(results) => publish_results(config, &producer, results).await?,
                             Err(error) => {
                                 match config.invalid_message_policy {
@@ -149,6 +157,7 @@ fn configure_security(client: &mut ClientConfig, config: &KafkaConfig) {
 async fn process_message(
     pipeline: &Arc<Mutex<Pipeline>>,
     message: &rdkafka::message::BorrowedMessage<'_>,
+    log_consumed_messages: bool,
 ) -> Result<Vec<AnomalyMessage>> {
     let headers = decode_headers(message.headers())?;
     let matched_streams = {
@@ -169,10 +178,22 @@ async fn process_message(
         .context("matching Kafka message has no payload")?;
     let telemetry: TelemetryMessage = serde_json::from_slice(payload)
         .context("matching Kafka payload is not valid telemetry JSON")?;
+    let telemetry_for_log = log_consumed_messages.then(|| telemetry.clone());
     let outcome = {
         let mut pipeline = pipeline.lock().await;
         pipeline.ingest(matched_streams, &headers, telemetry)?
     };
+    if let Some(telemetry) = telemetry_for_log {
+        tracing::info!(
+            topic = message.topic(),
+            partition = message.partition(),
+            offset = message.offset(),
+            headers = ?headers,
+            matched_streams = ?outcome.matched_streams,
+            telemetry = ?telemetry,
+            "consumed Kafka telemetry accepted by configured header filters"
+        );
+    }
     for stream in &outcome.late_streams {
         tracing::warn!(
             stream,
@@ -186,7 +207,7 @@ async fn process_message(
             stream,
             partition = message.partition(),
             offset = message.offset(),
-            "interpolation gap exceeded 20% limit; cleared stream window and restarted priming"
+            "interpolation gap exceeded the configured point limit; cleared stream window and restarted priming"
         );
     }
     for (stream, count) in &outcome.interpolated_points {
@@ -270,6 +291,13 @@ async fn publish_results(
             anomaly_score = ?result.anomaly_score,
             "published anomaly result"
         );
+        if config.logging.log_produced_results {
+            tracing::info!(
+                topic = %config.output_topic,
+                result = ?result,
+                "published Kafka anomaly result"
+            );
+        }
     }
     Ok(())
 }
